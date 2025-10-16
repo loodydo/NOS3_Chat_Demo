@@ -20,6 +20,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Iterable, List, Tuple
+from dotenv import load_dotenv
 
 from bs4 import BeautifulSoup
 from langchain.chains import ConversationalRetrievalChain
@@ -30,12 +31,14 @@ from langchain_cerebras import ChatCerebras
 from langchain_ollama import OllamaEmbeddings
 from pydantic import ValidationError
 
+load_dotenv()
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_HOST")
+DEFAULT_EMBED_MODEL = os.getenv("DEFAULT_EMBED_MODEL")
 DEFAULT_SOURCE_URL = "https://nos3.readthedocs.io/en/latest/"
 DEFAULT_PERSIST_DIR = Path("storage") / "nos3_docs_chroma"
 DEFAULT_COLLECTION_NAME = "nos3_docs"
-DEFAULT_EMBED_MODEL = "embeddinggemma:latest"
 DEFAULT_CEREBRAS_MODEL = "gpt-oss-120b"
-DEFAULT_OLLAMA_URL = "http://c240010:11434"
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,8 +175,8 @@ def build_chat_chain(
     api_key: str | None = None,
 ) -> ConversationalRetrievalChain:
     """Create a conversational retrieval chain using Cerebras and the provided retriever."""
-    resolved_key = api_key or os.getenv("CEREBRAS_API_KEY")
-    if not resolved_key:
+    api_key = CEREBRAS_API_KEY
+    if not api_key:
         raise EnvironmentError("Set the CEREBRAS_API_KEY environment variable before running.")
 
     try:
