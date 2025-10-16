@@ -165,14 +165,19 @@ def get_vector_store(
     )
 
 
-def build_chat_chain(vector_store: Chroma, model_name: str) -> ConversationalRetrievalChain:
+def build_chat_chain(
+    vector_store: Chroma,
+    model_name: str,
+    *,
+    api_key: str | None = None,
+) -> ConversationalRetrievalChain:
     """Create a conversational retrieval chain using Cerebras and the provided retriever."""
-    api_key = os.getenv("CEREBRAS_API_KEY")
-    if not api_key:
+    resolved_key = api_key or os.getenv("CEREBRAS_API_KEY")
+    if not resolved_key:
         raise EnvironmentError("Set the CEREBRAS_API_KEY environment variable before running.")
 
     try:
-        llm = ChatCerebras(model=model_name, cerebras_api_key=api_key)
+        llm = ChatCerebras(model=model_name, cerebras_api_key=resolved_key)
     except ValidationError as exc:
         raise RuntimeError(
             "Failed to initialize ChatCerebras. Verify your API key and model name."

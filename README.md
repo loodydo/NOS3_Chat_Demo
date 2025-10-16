@@ -28,6 +28,13 @@ python rag_chat.py
 
 The first launch crawls the NOS3 docs and writes the vector store to `storage/nos3_docs_chroma`. Subsequent runs reuse those embeddings.
 
+## Web Interface
+Start a browser-based chat by running:
+```bash
+python web_chat.py
+```
+The FastAPI server defaults to `http://0.0.0.0:8000/` and serves a lightweight UI that keeps the conversation history client-side. Open the **Settings** drawer to enter your Cerebras, Groq, and SambaNova API keys, refresh the live model list from each provider, and pick the exact alias you want to route to—each key/model choice can be remembered locally per browser. The backend automatically round-robins across every working key, always targeting the `gpt-oss-120b` family while transparently falling back to the provider-specific aliases you select, and any invalid key/model pair is dropped from the rotation. Use the **New Chat** button to clear the conversation history, and enjoy Markdown-aware rendering for tables, code blocks, and inline formatting. All vector store and model parameters mirror the CLI defaults; override them with flags (for example, `--port 8080 --reload`) or export environment variables such as `SAT_WEB_PERSIST_DIR`, `SAT_WEB_SOURCE_URL`, `SAT_WEB_REBUILD=1`, `SAT_WEB_CEREBRAS_KEY`, `SAT_WEB_GROQ_KEY`, `SAT_WEB_SAMBANOVA_KEY`, `SAT_WEB_CEREBRAS_MODELS`, `SAT_WEB_GROQ_MODELS`, or `SAT_WEB_SAMBANOVA_MODELS` before launching.
+
 ## Command Reference
 ```bash
 python rag_chat.py [options]
