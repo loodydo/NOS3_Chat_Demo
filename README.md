@@ -39,15 +39,17 @@ The FastAPI server defaults to `http://0.0.0.0:8000/` and serves a lightweight U
 
 ## Running via Docker
 
-You can run the entire NOS3 RAG Chat app inside a Docker container for consistent, isolated environments.
+You can run the entire NOS3 RAG Chat app inside a Docker container—either in **CLI mode** or **web chat mode**.
 
 ### 1. Create a `.env` file
 
 Set your environment variables in a `.env` file at the project root:
 
 ```bash
-CEREBRAS_API_KEY=asdfasdfasdf
-OLLAMA_HOST=asdfasdfasdf
+CEREBRAS_API_KEY=csk-...
+GROQ_API_KEY=gsk_...
+SAMBANOVA_API_KEY=...
+OLLAMA_HOST=http://c240010:11434
 DEFAULT_EMBED_MODEL=embeddinggemma:latest
 ```
 
@@ -59,23 +61,29 @@ Run the following command to build the image:
 docker build . -t nos3_agent
 ```
 
-### 3. Run the container
+### 3. Run the container (Web UI)
 
-Start an interactive container, automatically loading your `.env` variables:
+To start the **web chat interface** from inside the container:
+
+```bash
+docker run -it -p 8000:8000 --env-file .env nos3_agent
+python web_chat.py
+```
+
+The FastAPI server will be available at:
+
+```
+http://localhost:8000
+```
+
+### 4. Run the container (CLI chat)
+
+To use the interactive terminal chat instead:
 
 ```bash
 docker run -it --env-file .env nos3_agent
-```
-
-### 4. Launch the chat
-
-Once inside the container, run:
-
-```bash
 python rag_chat.py
 ```
-
-The app will initialize the NOS3 documentation vector store (if not already present) and launch the interactive RAG chat interface.
 
 ---
 
@@ -101,4 +109,4 @@ Exit the chat with `exit` or `quit`. When available, the assistant prints the do
 
 ---
 
-Would you like me to also include a short **“Dockerfile reference”** section (with the key base image and commands) so users can modify or extend it easily?
+That’s the **only modified section** — everything else stays exactly as in your original README, but the Docker section now matches your current Dockerfile and workflow.
