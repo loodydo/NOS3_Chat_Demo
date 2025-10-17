@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -1305,6 +1306,30 @@ def _parse_models(value: str | None, default: List[str]) -> List[str]:
     return models or default[:]
 
 
+def _normalize_ollama_url(url: str | None) -> str | None:
+    if not url:
+        return url
+    cleaned = url.strip()
+    if not cleaned:
+        return url
+    if not cleaned.startswith(("http://", "https://")):
+        cleaned = f"http://{cleaned}"
+    parsed = urlparse(cleaned)
+    host = parsed.hostname or ""
+    if host in {"0.0.0.0", ""}:
+        replacement_host = "localhost"
+        userinfo = ""
+        if parsed.username:
+            userinfo = parsed.username
+            if parsed.password:
+                userinfo += f":{parsed.password}"
+            userinfo += "@"
+        port = f":{parsed.port}" if parsed.port else ""
+        netloc = f"{userinfo}{replacement_host}{port}"
+        cleaned = urlunparse(parsed._replace(netloc=netloc))
+    return cleaned
+
+
 def load_config_from_env() -> WebConfig:
     cerebras_models_env = _parse_models(_env_str("SAT_WEB_CEREBRAS_MODELS", None), DEFAULT_MODEL_CANDIDATES["cerebras"])
     cerebras_model_env = _env_str("SAT_WEB_CEREBRAS_MODEL", None)
@@ -1319,6 +1344,8 @@ def load_config_from_env() -> WebConfig:
     sambanova_model_env = _env_str("SAT_WEB_SAMBANOVA_MODEL", None)
     sambanova_models = _merge_candidates([sambanova_model_env] if sambanova_model_env else None, sambanova_models_env, DEFAULT_MODEL_CANDIDATES["sambanova"])
 
+    ollama_url = _normalize_ollama_url(os.getenv("SAT_WEB_OLLAMA_URL", DEFAULT_OLLAMA_URL))
+
     return WebConfig(
         host=os.getenv("SAT_WEB_HOST", "0.0.0.0"),
         port=_env_int("SAT_WEB_PORT", 8000),
@@ -1329,7 +1356,7 @@ def load_config_from_env() -> WebConfig:
         chunk_size=_env_int("SAT_WEB_CHUNK_SIZE", 1000),
         chunk_overlap=_env_int("SAT_WEB_CHUNK_OVERLAP", 150),
         rebuild=_env_bool("SAT_WEB_REBUILD", False),
-        ollama_url=os.getenv("SAT_WEB_OLLAMA_URL", DEFAULT_OLLAMA_URL),
+        ollama_url=ollama_url,
         embedding_model=os.getenv("SAT_WEB_EMBED_MODEL", DEFAULT_EMBED_MODEL),
         cerebras_model=cerebras_model,
         cerebras_api_key=_env_str("SAT_WEB_CEREBRAS_KEY", _env_str("CEREBRAS_API_KEY")),
@@ -1461,6 +1488,8 @@ if __name__ == "__main__":
         DEFAULT_MODEL_CANDIDATES["sambanova"],
     )
 
+    normalized_ollama = _normalize_ollama_url(args.ollama_url)
+
     config = WebConfig(
         host=args.host,
         port=args.port,
@@ -1471,7 +1500,7 @@ if __name__ == "__main__":
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
         rebuild=args.rebuild,
-        ollama_url=args.ollama_url,
+        ollama_url=normalized_ollama,
         embedding_model=args.embedding_model,
         cerebras_model=cerebras_model_cli,
         cerebras_api_key=(args.cerebras_api_key.strip() if args.cerebras_api_key else None),
