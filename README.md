@@ -10,7 +10,7 @@ Retrieval-augmented chat assistant that answers questions about the NASA Operati
 
 ## Requirements
 - Python 3.9 or later
-- Access to an Ollama runtime hosting the embedding model (default URL `http://c240010:11434`)
+- Access to an Ollama runtime hosting the embedding model (default URL `http://localhost:11434`)
 - Cerebras Inference API key available as the `CEREBRAS_API_KEY` environment variable
 - Internet access on first run (or whenever rebuilding the document index)
 - Dependencies listed in `requirements.txt`
