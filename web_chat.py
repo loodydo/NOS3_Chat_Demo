@@ -235,6 +235,25 @@ HTML_PAGE = """<!DOCTYPE html>
             </select>
           </div>
         </div>
+
+        <div class="settings-card" data-provider="embeddings">
+          <div class="settings-card-header">
+            <span class="settings-card-title">Embeddings (Ollama)</span>
+            <button type="button" class="button" id="apply-embeddings">Apply &amp; Rebuild</button>
+          </div>
+          <div>
+            <label class="settings-label" for="ollama-url">Ollama URL</label>
+            <div class="input-row">
+              <input id="ollama-url" type="text" placeholder="http://localhost:11434" autocomplete="off" />
+            </div>
+          </div>
+          <div>
+            <label class="settings-label" for="embedding-model">Embedding Model</label>
+            <div class="input-row">
+              <input id="embedding-model" type="text" placeholder="embeddinggemma:latest" autocomplete="off" />
+            </div>
+          </div>
+        </div>
       </div>
     </section>
     <div id="chat-log" class="chat-log"></div>
@@ -264,6 +283,12 @@ HTML_PAGE = """<!DOCTYPE html>
       ];
 
       const providerState = {};
+      const embeddingsState = {
+        urlInput: null,
+        modelInput: null,
+        applyButton: null,
+        loading: false,
+      };
 
       const storageKeys = (providerId) => ({
         key: `nos3-rag-${providerId}-key`,
@@ -368,6 +393,10 @@ HTML_PAGE = """<!DOCTYPE html>
           state.modelSelect.disabled = disabled || !state.models.length;
           state.fetchButton.disabled = disabled || !state.keyInput.value.trim();
         });
+        const embeddingDisabled = chatLoading || embeddingsState.loading;
+        if (embeddingsState.urlInput) embeddingsState.urlInput.disabled = embeddingDisabled;
+        if (embeddingsState.modelInput) embeddingsState.modelInput.disabled = embeddingDisabled;
+        if (embeddingsState.applyButton) embeddingsState.applyButton.disabled = embeddingDisabled;
       };
 
       const setLoading = (loading) => {
@@ -533,7 +562,72 @@ HTML_PAGE = """<!DOCTYPE html>
         state.fetchButton.addEventListener("click", () => fetchProviderModels(id));
       };
 
+      const initEmbeddings = () => {
+        embeddingsState.urlInput = document.getElementById("ollama-url");
+        embeddingsState.modelInput = document.getElementById("embedding-model");
+        embeddingsState.applyButton = document.getElementById("apply-embeddings");
+
+        if (!embeddingsState.urlInput || !embeddingsState.modelInput || !embeddingsState.applyButton) {
+          console.warn("Embedding configuration elements missing from the page.");
+          return;
+        }
+
+        embeddingsState.applyButton.addEventListener("click", async () => {
+          const url = (embeddingsState.urlInput.value || "").trim();
+          const model = (embeddingsState.modelInput.value || "").trim();
+          if (!url || !model) {
+            updateSettingsStatus("Provide both an Ollama URL and an embedding model.", true);
+            return;
+          }
+          embeddingsState.loading = true;
+          refreshProviderDisabled();
+          updateSettingsStatus("Updating embeddings and rebuilding knowledge base...");
+          try {
+            const response = await fetch("/api/embeddings", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ollama_url: url, embedding_model: model, rebuild: true }),
+            });
+            if (!response.ok) {
+              let detail = "Failed to apply embedding settings.";
+              try {
+                const err = await response.json();
+                detail = err.detail || detail;
+              } catch (_) {}
+              updateSettingsStatus(detail, true);
+              return;
+            }
+            const payload = await response.json();
+            updateSettingsStatus(`Embeddings updated. Model: ${payload.embedding_model}`);
+          } catch (error) {
+            console.error(error);
+            updateSettingsStatus("Error applying embeddings. See console for details.", true);
+          } finally {
+            embeddingsState.loading = false;
+            refreshProviderDisabled();
+          }
+        });
+      };
+
+      const loadInitialEmbeddings = async () => {
+        try {
+          const response = await fetch("/api/embeddings");
+          if (!response.ok) return;
+          const payload = await response.json();
+          if (embeddingsState.urlInput && payload.ollama_url) {
+            embeddingsState.urlInput.value = payload.ollama_url;
+          }
+          if (embeddingsState.modelInput && payload.embedding_model) {
+            embeddingsState.modelInput.value = payload.embedding_model;
+          }
+        } catch (error) {
+          console.warn("Failed to load initial embedding configuration.", error);
+        }
+      };
+
       PROVIDERS.forEach(initProvider);
+      initEmbeddings();
+      loadInitialEmbeddings();
       refreshProviderDisabled();
 
       const toggleSettings = () => {
@@ -691,6 +785,17 @@ class ProviderModelResponse(BaseModel):
 
 class ProviderModelsSummary(BaseModel):
     providers: List[ProviderModelResponse]
+
+
+class EmbeddingSettings(BaseModel):
+    ollama_url: str
+    embedding_model: str
+
+
+class EmbeddingSettingsRequest(BaseModel):
+    ollama_url: Optional[str] = None
+    embedding_model: Optional[str] = None
+    rebuild: bool = True
 
 
 class ModelSelectionError(Exception):
@@ -1033,6 +1138,51 @@ def create_app(config: WebConfig) -> FastAPI:
             app.state.selected_models[provider] = models[0]
 
         return ProviderModelResponse(provider=provider, models=models, selected=models[0] if models else None)
+
+    @app.get("/api/embeddings", response_model=EmbeddingSettings)
+    def get_embeddings() -> EmbeddingSettings:
+        return EmbeddingSettings(
+            ollama_url=app.state.config.ollama_url,
+            embedding_model=app.state.config.embedding_model,
+        )
+
+    @app.post("/api/embeddings", response_model=EmbeddingSettings)
+    async def set_embeddings(request: EmbeddingSettingsRequest) -> EmbeddingSettings:
+        url = (request.ollama_url or app.state.config.ollama_url or "").strip()
+        model = (request.embedding_model or app.state.config.embedding_model or "").strip()
+        if not url or not model:
+            raise HTTPException(status_code=400, detail="Both ollama_url and embedding_model are required.")
+
+        url = _normalize_ollama_url(url) or url
+        app.state.config.ollama_url = url
+        app.state.config.embedding_model = model
+
+        if request.rebuild:
+            prev_rebuild = app.state.config.rebuild
+            try:
+                app.state.config.rebuild = True
+                (
+                    vector_store,
+                    default_chain,
+                    key_ring,
+                    initial_cache,
+                    provider_catalog,
+                    selected_map,
+                ) = await run_in_threadpool(build_chain, app.state.config)
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=500, detail=f"Failed to rebuild knowledge base: {exc}") from exc
+            finally:
+                app.state.config.rebuild = prev_rebuild
+
+            app.state.vector_store = vector_store
+            app.state.default_chain = default_chain
+            app.state.key_ring = key_ring
+            app.state.chain_cache = dict(initial_cache)
+            app.state.provider_catalog = {k: v[:] for k, v in provider_catalog.items()}
+            app.state.selected_models = dict(selected_map)
+            app.state.key_index = 0
+
+        return EmbeddingSettings(ollama_url=url, embedding_model=model)
 
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(payload: ChatRequest) -> ChatResponse:
