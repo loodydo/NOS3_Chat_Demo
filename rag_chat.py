@@ -31,6 +31,19 @@ from langchain_cerebras import ChatCerebras
 from langchain_ollama import OllamaEmbeddings
 from pydantic import ValidationError
 
+from orbit_mcp import (
+    OrbitMCPConfig,
+    OrbitMCPError,
+    default_orbit_mcp_log_dir,
+    default_orbit_mcp_run_dir,
+    is_orbit_command,
+    load_orbit_mcp_config,
+    new_orbit_mcp_log_path,
+    new_orbit_mcp_run_dir,
+    parse_orbit_command,
+    visualize_orbit,
+)
+
 load_dotenv()
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_HOST")
@@ -198,6 +211,7 @@ def build_chat_chain(
 def interactive_chat(chain: ConversationalRetrievalChain) -> None:
     """Run a terminal-based interactive chat loop."""
     print("NOS3 RAG assistant ready. Type 'exit' or 'quit' to finish.")
+    print("Tip: run `/orbit <lat> <lon>` to launch the orbit visualization.")
     chat_history: List[Tuple[str, str]] = []
 
     while True:
@@ -213,6 +227,39 @@ def interactive_chat(chain: ConversationalRetrievalChain) -> None:
         if user_input.lower() in {"exit", "quit"}:
             print("Goodbye!")
             break
+
+        if is_orbit_command(user_input):
+            orbit_args = parse_orbit_command(user_input)
+            if orbit_args is None:
+                answer = "Usage: /orbit <latitude> <longitude> (example: /orbit 40.7128 -74.0060)"
+                print("\nAssistant:", answer)
+                chat_history.append((user_input, answer))
+                continue
+            lat, lon = orbit_args
+            print("\nAssistant: Launching orbit visualization (close the window to continue)...")
+            try:
+                log_path = new_orbit_mcp_log_path("orbit_mcp_orbit", log_dir=default_orbit_mcp_log_dir())
+                run_dir = new_orbit_mcp_run_dir("orbit_mcp_run", run_dir=default_orbit_mcp_run_dir())
+                run_dir.mkdir(parents=True, exist_ok=True)
+                base_config = load_orbit_mcp_config()
+                orbit_config = OrbitMCPConfig(
+                    python_executable=base_config.python_executable,
+                    server_script=base_config.server_script,
+                    protocol_version=base_config.protocol_version,
+                    init_timeout_s=base_config.init_timeout_s,
+                    framing=base_config.framing,
+                    env={
+                        "SAT_ORBIT_RUN_DIR": str(run_dir),
+                        "SAT_ORBIT_ROLE": "server",
+                    },
+                )
+                answer = visualize_orbit(lat, lon, config=orbit_config, log_path=log_path)
+                answer = f"{answer}\nRun: {run_dir}\nLog: {log_path}"
+            except OrbitMCPError as exc:
+                answer = f"Orbit simulation failed: {exc}"
+            print("\nAssistant:", answer)
+            chat_history.append((user_input, answer))
+            continue
 
         response = chain({"question": user_input, "chat_history": chat_history})
         answer = response.get("answer", "").strip()

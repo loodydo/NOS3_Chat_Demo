@@ -5,10 +5,14 @@ FastAPI-powered web chat interface for the NOS3 documentation RAG assistant.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
+import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -21,6 +25,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_groq import ChatGroq
 from langchain_sambanova import ChatSambaNova
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -33,6 +38,225 @@ from rag_chat import (
     build_chat_chain,
     get_vector_store,
 )
+
+from orbit_mcp import (
+    OrbitMCPConfig,
+    OrbitMCPError,
+    default_orbit_mcp_log_dir,
+    default_orbit_mcp_run_dir,
+    get_active_orbit_simulation,
+    is_orbit_command,
+    new_orbit_mcp_log_path,
+    new_orbit_mcp_run_dir,
+    parse_orbit_command,
+    start_visualize_orbit,
+    stop_active_orbit_simulation,
+    test_connection,
+)
+
+
+_FLOAT_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)")
+
+_ORBIT_INTENT_KEYWORDS = (
+    "orbit sim",
+    "orbit simulation",
+    "simulate orbit",
+    "visualize orbit",
+    "run orbit",
+    "start orbit",
+    "launch orbit",
+    "show orbit",
+    "plot orbit",
+    "animate orbit",
+    "satellite sim",
+)
+
+_ORBIT_CONTEXT_KEYWORDS = ("orbit", "satellite", "iss", "target", "latitude", "longitude", "lat", "lon")
+_ORBIT_ACTION_KEYWORDS = ("run", "start", "launch", "simulate", "visualize", "show", "plot", "animate")
+
+
+def _extract_lat_lon_from_text(text: str) -> tuple[float, float] | None:
+    matches = _FLOAT_RE.findall(text or "")
+    if len(matches) < 2:
+        return None
+    values: list[float] = []
+    for match in matches:
+        try:
+            values.append(float(match))
+        except ValueError:
+            continue
+    for idx in range(len(values) - 1):
+        lat, lon = values[idx], values[idx + 1]
+        if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+            return lat, lon
+    return None
+
+
+def _should_attempt_orbit_nl_routing(message: str, history: list["ChatTurn"]) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    coords = _extract_lat_lon_from_text(text)
+    if any(keyword in text for keyword in _ORBIT_INTENT_KEYWORDS):
+        return True
+    if any(keyword in text for keyword in _ORBIT_ACTION_KEYWORDS) and any(keyword in text for keyword in _ORBIT_CONTEXT_KEYWORDS):
+        return True
+    if coords is None:
+        return False
+    if any(keyword in text for keyword in _ORBIT_ACTION_KEYWORDS):
+        return True
+    if "target" in text:
+        return True
+    if history:
+        last = (history[-1].answer or "").lower()
+        if "orbit" in last and ("latitude" in last or "longitude" in last or "/orbit" in last):
+            return True
+    return False
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+        if "\n" in raw:
+            raw = raw.split("\n", 1)[1].strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    candidate = raw[start : end + 1] if start != -1 and end != -1 and end > start else raw
+    try:
+        payload = json.loads(candidate)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _create_router_llm(provider: str, model_name: str, api_key: str):
+    provider = (provider or "").strip().lower()
+    if provider == "cerebras":
+        from langchain_cerebras import ChatCerebras
+
+        try:
+            return ChatCerebras(model=model_name, cerebras_api_key=api_key, temperature=0)
+        except TypeError:
+            return ChatCerebras(model=model_name, cerebras_api_key=api_key)
+    if provider == "groq":
+        try:
+            return ChatGroq(model_name=model_name, groq_api_key=api_key, temperature=0)
+        except TypeError:
+            return ChatGroq(model_name=model_name, groq_api_key=api_key)
+    if provider == "sambanova":
+        try:
+            return ChatSambaNova(model=model_name, api_key=api_key, temperature=0)
+        except TypeError:
+            return ChatSambaNova(model=model_name, api_key=api_key)
+    raise ValueError(f"Unsupported provider for router: {provider}")
+
+
+def _select_router_model(config: "WebConfig", selected_models: dict[str, str], provider: str) -> str | None:
+    provider = provider.lower()
+    selected = selected_models.get(provider)
+    if selected:
+        return selected
+    if provider == "cerebras":
+        return config.cerebras_model
+    if provider == "groq":
+        return (config.groq_models or [None])[0]
+    if provider == "sambanova":
+        return (config.sambanova_models or [None])[0]
+    return None
+
+
+def _route_orbit_request_with_llm(llm, message: str) -> dict[str, Any] | None:
+    system = SystemMessage(
+        content=(
+            "You are a router for Sat.AI.\n"
+            "Sat.AI has two separate capabilities:\n"
+            "1) Answer questions about the NOS3 documentation.\n"
+            "2) Run an orbit visualization tool called `visualize_orbit` that requires a target latitude and longitude in degrees.\n\n"
+            "Decide what to do for the user's message.\n"
+            "- If the user is asking to run/launch/simulate/visualize the orbit tool, extract coordinates and output ONLY valid JSON:\n"
+            '  {"action":"orbit","latitude":<float>,"longitude":<float>}\n'
+            "- If they want the orbit tool but coordinates are missing/unclear, output ONLY valid JSON:\n"
+            '  {"action":"clarify","question":"<ask for latitude and longitude>"}\n'
+            "- Otherwise output ONLY valid JSON:\n"
+            '  {"action":"chat"}\n\n'
+            "Rules:\n"
+            "- Only output JSON. No markdown, no backticks, no extra text.\n"
+            "- Latitude must be between -90 and 90. Longitude between -180 and 180.\n"
+        )
+    )
+    human = HumanMessage(content=message)
+    try:
+        response = llm.invoke([system, human])
+    except Exception:
+        return None
+    content = getattr(response, "content", None)
+    if content is None:
+        content = str(response)
+    return _parse_json_object(str(content))
+
+
+def _start_orbit_from_chat(config: "WebConfig", lat: float, lon: float) -> tuple[str, str, str]:
+    run_dir = new_orbit_mcp_run_dir("orbit_mcp_run", run_dir=default_orbit_mcp_run_dir())
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    run_dir_text = _format_repo_path(run_dir)
+
+    orbit_config = OrbitMCPConfig(
+        python_executable=config.orbit_mcp_python,
+        server_script=config.orbit_mcp_server,
+        protocol_version=config.orbit_mcp_protocol_version,
+        init_timeout_s=config.orbit_mcp_init_timeout_s,
+        framing=config.orbit_mcp_framing,
+        env={
+            "SAT_ORBIT_RUN_DIR": str(run_dir),
+            "SAT_ORBIT_ROLE": "server",
+        },
+    )
+
+    done_event = threading.Event()
+    outcome: Dict[str, Any] = {"result": None, "error": None}
+    log_path = new_orbit_mcp_log_path("orbit_mcp_orbit", log_dir=default_orbit_mcp_log_dir())
+    log_path_text = _format_repo_path(log_path)
+
+    def on_done(result: str | None, err: Exception | None) -> None:
+        outcome["result"] = result
+        outcome["error"] = err
+        done_event.set()
+        print(
+            f"[orbit] {'error: ' + str(err) if err else 'completed: ' + (result or '')} (log={log_path_text} run={run_dir_text})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    start_visualize_orbit(
+        lat,
+        lon,
+        config=orbit_config,
+        on_done=on_done,
+        log_path=log_path,
+    )
+
+    if done_event.wait(timeout=0.75):
+        err = outcome.get("error")
+        result = outcome.get("result")
+        if err is not None:
+            answer = f"Orbit visualization failed: {err}\nRun: `{run_dir_text}`\nLog: `{log_path_text}`"
+        else:
+            answer = ((result or "").strip() or "Orbit visualization finished.") + f"\nRun: `{run_dir_text}`\nLog: `{log_path_text}`"
+    else:
+        answer = (
+            f"Orbit visualization started for ({lat}, {lon}). "
+            "A Matplotlib window should open on the server machine; close it to finish."
+            f"\nRun: `{run_dir_text}`"
+            f"\nLog: `{log_path_text}`"
+        )
+
+    return answer, run_dir_text, log_path_text
 
 PROVIDER_LABELS: Dict[str, str] = {
     "cerebras": "Cerebras",
@@ -73,6 +297,30 @@ class WebConfig:
     sambanova_api_key: str | None = None
     groq_models: List[str] = field(default_factory=lambda: DEFAULT_MODEL_CANDIDATES["groq"][:])
     sambanova_models: List[str] = field(default_factory=lambda: DEFAULT_MODEL_CANDIDATES["sambanova"][:])
+    orbit_mcp_python: str = field(default_factory=lambda: sys.executable)
+    orbit_mcp_server: Path = field(
+        default_factory=lambda: Path(__file__).resolve().parent / "SAT_Orbit_Sim_MCP" / "satellite_server.py"
+    )
+    orbit_mcp_protocol_version: str = "2024-11-05"
+    orbit_mcp_init_timeout_s: float = 30.0
+    orbit_mcp_framing: str = "ndjson"
+
+
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_repo_path(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (_REPO_ROOT / path).resolve()
+    return path
+
+
+def _format_repo_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(_REPO_ROOT))
+    except Exception:
+        return str(path)
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -80,7 +328,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NOS3 RAG Chat</title>
+  <title>Sat.AI</title>
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
@@ -92,6 +340,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .title { margin: 0; font-size: 2rem; letter-spacing: 0.02em; }
     .subtitle { margin: 4px 0 0; color: #a5b6d0; max-width: 640px; }
     .control-bar { display: flex; gap: 12px; flex-wrap: wrap; }
+    .button-row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
     .button, .chat-form button { padding: 12px 20px; border-radius: 999px; border: none; background: #3d7eff; color: #fff; font-weight: 600; cursor: pointer; transition: background 0.2s ease; }
     .button.secondary { background: transparent; border: 1px solid #34527a; color: #c7d5eb; }
     .button:hover:not(:disabled), .chat-form button:hover:not(:disabled) { background: #2667d4; }
@@ -140,6 +389,15 @@ HTML_PAGE = """<!DOCTYPE html>
     .sources { background: #111e33; border-left: 4px solid #3d7eff; padding: 12px 16px; margin: 8px 0 16px; border-radius: 8px; color: #c7d5eb; }
     .sources .label { font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; color: #8aa3c6; }
     .sources ul { margin: 0; padding-left: 20px; }
+    .mcp-tools { font-size: 0.85rem; color: #c7d5eb; line-height: 1.4; }
+    .mcp-tools ul { margin: 0; padding-left: 18px; }
+    .mcp-tools li { margin: 4px 0; }
+    .mcp-log-header { margin-top: 10px; }
+    .mcp-log-path { font-size: 0.8rem; color: #8aa3c6; word-break: break-all; }
+    .mcp-log-list { background: rgba(15, 31, 51, 0.6); border: 1px solid #233654; border-radius: 12px; padding: 10px 12px; max-height: 170px; overflow-y: auto; }
+    .mcp-log-item { width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(61, 126, 255, 0.25); background: rgba(61, 126, 255, 0.06); color: #c7d5eb; text-align: left; cursor: pointer; margin: 6px 0; font-size: 0.85rem; }
+    .mcp-log-item:hover { background: rgba(61, 126, 255, 0.14); }
+    .mcp-log-content { background: #0f1f33; border: 1px solid #233654; border-radius: 12px; padding: 12px; max-height: 280px; overflow: auto; white-space: pre-wrap; font-family: "Fira Code", Consolas, monospace; font-size: 0.8rem; color: #f4f6fb; }
     @media (max-width: 640px) {
       .container { padding: 24px 16px; }
       .header { flex-direction: column; align-items: stretch; }
@@ -154,7 +412,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="container">
     <div class="header">
       <div>
-        <h1 class="title">NOS3 RAG Chat</h1>
+        <h1 class="title">Sat.AI</h1>
         <p class="subtitle">Ask questions about the NOS3 documentation, compare answers across providers, and explore sourced references.</p>
       </div>
       <div class="control-bar">
@@ -254,6 +512,59 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
           </div>
         </div>
+
+        <div class="settings-card" data-provider="mcp-orbit">
+          <div class="settings-card-header">
+            <span class="settings-card-title">MCP (Orbit Sim)</span>
+            <div class="button-row">
+              <button type="button" class="button secondary" id="stop-mcp-orbit">Stop Orbit</button>
+              <button type="button" class="button" id="test-mcp-orbit">Test &amp; List Tools</button>
+            </div>
+          </div>
+          <div>
+            <label class="settings-label" for="mcp-orbit-server">Server Script</label>
+            <div class="input-row">
+              <input id="mcp-orbit-server" type="text" placeholder="SAT_Orbit_Sim_MCP/satellite_server.py" autocomplete="off" />
+            </div>
+          </div>
+          <div>
+            <label class="settings-label" for="mcp-orbit-python">Python Executable</label>
+            <div class="input-row">
+              <input id="mcp-orbit-python" type="text" placeholder="python3" autocomplete="off" />
+            </div>
+          </div>
+          <div>
+            <label class="settings-label" for="mcp-orbit-protocol">Protocol Version</label>
+            <div class="input-row">
+              <input id="mcp-orbit-protocol" type="text" placeholder="2024-11-05" autocomplete="off" />
+            </div>
+          </div>
+          <div>
+            <label class="settings-label" for="mcp-orbit-framing">Message Framing</label>
+            <div class="input-row">
+              <select id="mcp-orbit-framing" class="model-select">
+                <option value="ndjson">ndjson (FastMCP)</option>
+                <option value="lsp">lsp (Content-Length)</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label class="settings-label" for="mcp-orbit-timeout">Init Timeout (seconds)</label>
+            <div class="input-row">
+              <input id="mcp-orbit-timeout" type="number" step="0.1" min="0" placeholder="30" autocomplete="off" />
+              <button type="button" class="button secondary" id="save-mcp-orbit">Save</button>
+            </div>
+          </div>
+          <div id="mcp-orbit-tools" class="mcp-tools"></div>
+          <div id="mcp-orbit-sim-status" class="mcp-log-path"></div>
+          <div class="settings-card-header mcp-log-header">
+            <span class="settings-card-title">MCP Logs</span>
+            <button type="button" class="button secondary" id="refresh-mcp-orbit-logs">Refresh</button>
+          </div>
+          <div id="mcp-orbit-log-path" class="mcp-log-path"></div>
+          <div id="mcp-orbit-logs" class="mcp-log-list"></div>
+          <pre id="mcp-orbit-log-content" class="mcp-log-content"></pre>
+        </div>
       </div>
     </section>
     <div id="chat-log" class="chat-log"></div>
@@ -288,6 +599,31 @@ HTML_PAGE = """<!DOCTYPE html>
         modelInput: null,
         applyButton: null,
         loading: false,
+      };
+      const orbitMcpState = {
+        serverInput: null,
+        pythonInput: null,
+        protocolInput: null,
+        framingSelect: null,
+        timeoutInput: null,
+        saveButton: null,
+        testButton: null,
+        stopButton: null,
+        toolsBox: null,
+        simStatusBox: null,
+        logPathBox: null,
+        logsBox: null,
+        logContentBox: null,
+        refreshLogsButton: null,
+        loading: false,
+      };
+
+      const orbitMcpStorage = {
+        server: "nos3-rag-mcp-orbit-server",
+        python: "nos3-rag-mcp-orbit-python",
+        protocol: "nos3-rag-mcp-orbit-protocol",
+        framing: "nos3-rag-mcp-orbit-framing",
+        timeout: "nos3-rag-mcp-orbit-timeout",
       };
 
       const storageKeys = (providerId) => ({
@@ -397,6 +733,17 @@ HTML_PAGE = """<!DOCTYPE html>
         if (embeddingsState.urlInput) embeddingsState.urlInput.disabled = embeddingDisabled;
         if (embeddingsState.modelInput) embeddingsState.modelInput.disabled = embeddingDisabled;
         if (embeddingsState.applyButton) embeddingsState.applyButton.disabled = embeddingDisabled;
+
+        const orbitDisabled = chatLoading || orbitMcpState.loading;
+        if (orbitMcpState.serverInput) orbitMcpState.serverInput.disabled = orbitDisabled;
+        if (orbitMcpState.pythonInput) orbitMcpState.pythonInput.disabled = orbitDisabled;
+        if (orbitMcpState.protocolInput) orbitMcpState.protocolInput.disabled = orbitDisabled;
+        if (orbitMcpState.framingSelect) orbitMcpState.framingSelect.disabled = orbitDisabled;
+        if (orbitMcpState.timeoutInput) orbitMcpState.timeoutInput.disabled = orbitDisabled;
+        if (orbitMcpState.saveButton) orbitMcpState.saveButton.disabled = orbitDisabled;
+        if (orbitMcpState.testButton) orbitMcpState.testButton.disabled = orbitDisabled;
+        if (orbitMcpState.stopButton) orbitMcpState.stopButton.disabled = orbitDisabled;
+        if (orbitMcpState.refreshLogsButton) orbitMcpState.refreshLogsButton.disabled = orbitDisabled;
       };
 
       const setLoading = (loading) => {
@@ -434,11 +781,39 @@ HTML_PAGE = """<!DOCTYPE html>
         }
       };
 
+      const persistOrbitMcp = () => {
+        if (!orbitMcpState.serverInput || !orbitMcpState.pythonInput || !orbitMcpState.protocolInput || !orbitMcpState.framingSelect || !orbitMcpState.timeoutInput) {
+          return;
+        }
+
+        const server = (orbitMcpState.serverInput.value || "").trim();
+        const python = (orbitMcpState.pythonInput.value || "").trim();
+        const protocol = (orbitMcpState.protocolInput.value || "").trim();
+        const framing = (orbitMcpState.framingSelect.value || "").trim();
+        const timeout = (orbitMcpState.timeoutInput.value || "").trim();
+
+        if (server) localStorage.setItem(orbitMcpStorage.server, server);
+        else localStorage.removeItem(orbitMcpStorage.server);
+
+        if (python) localStorage.setItem(orbitMcpStorage.python, python);
+        else localStorage.removeItem(orbitMcpStorage.python);
+
+        if (protocol) localStorage.setItem(orbitMcpStorage.protocol, protocol);
+        else localStorage.removeItem(orbitMcpStorage.protocol);
+
+        if (framing) localStorage.setItem(orbitMcpStorage.framing, framing);
+        else localStorage.removeItem(orbitMcpStorage.framing);
+
+        if (timeout) localStorage.setItem(orbitMcpStorage.timeout, timeout);
+        else localStorage.removeItem(orbitMcpStorage.timeout);
+      };
+
       const syncStoredSettings = () => {
         PROVIDERS.forEach(({ id }) => {
           persistKey(id);
           persistModel(id);
         });
+        persistOrbitMcp();
       };
 
       const setProviderModels = (providerId, models, selected) => {
@@ -609,6 +984,340 @@ HTML_PAGE = """<!DOCTYPE html>
         });
       };
 
+      const renderOrbitToolList = (payload) => {
+        if (!orbitMcpState.toolsBox) return;
+        orbitMcpState.toolsBox.innerHTML = "";
+
+        const tools = payload && Array.isArray(payload.tools) ? payload.tools : [];
+        const serverInfo = payload && payload.server_info ? payload.server_info : null;
+        const protocolVersion = payload && payload.protocol_version ? payload.protocol_version : null;
+
+        if (serverInfo && (serverInfo.name || serverInfo.version || protocolVersion)) {
+          const header = document.createElement("div");
+          const name = serverInfo.name ? String(serverInfo.name) : "MCP server";
+          const version = serverInfo.version ? String(serverInfo.version) : "";
+          const proto = protocolVersion ? ` · protocol ${protocolVersion}` : "";
+          header.textContent = version ? `${name} ${version}${proto}` : `${name}${proto}`;
+          orbitMcpState.toolsBox.appendChild(header);
+        }
+
+        if (!tools.length) {
+          const empty = document.createElement("div");
+          empty.textContent = "No tools returned.";
+          orbitMcpState.toolsBox.appendChild(empty);
+          return;
+        }
+
+        const list = document.createElement("ul");
+        tools.forEach((tool) => {
+          if (!tool || !tool.name) return;
+          const item = document.createElement("li");
+          const name = String(tool.name);
+          const desc = tool.description ? String(tool.description) : "";
+          item.textContent = desc ? `${name} — ${desc}` : name;
+          list.appendChild(item);
+        });
+        orbitMcpState.toolsBox.appendChild(list);
+      };
+
+      const renderOrbitLogPath = (path) => {
+        if (!orbitMcpState.logPathBox) return;
+        orbitMcpState.logPathBox.textContent = path ? `Last log: ${path}` : "";
+      };
+
+      const renderOrbitSimStatus = (payload) => {
+        if (!orbitMcpState.simStatusBox) return;
+        const running = payload && payload.running;
+        if (!running) {
+          orbitMcpState.simStatusBox.textContent = "Orbit sim: idle";
+          return;
+        }
+        const pid = payload && payload.pid ? ` (pid ${payload.pid})` : "";
+        const logPath = payload && payload.log_path ? ` · log: ${payload.log_path}` : "";
+        const runDir = payload && payload.run_dir ? ` · run: ${payload.run_dir}` : "";
+        orbitMcpState.simStatusBox.textContent = `Orbit sim: RUNNING${pid}${logPath}${runDir}`;
+      };
+
+      const formatBytes = (bytes) => {
+        const value = Number(bytes) || 0;
+        if (value < 1024) return `${value} B`;
+        if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+        return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+      };
+
+      const renderOrbitLogList = (payload) => {
+        if (!orbitMcpState.logsBox) return;
+        orbitMcpState.logsBox.innerHTML = "";
+        const logs = payload && Array.isArray(payload.logs) ? payload.logs : [];
+        if (!logs.length) {
+          const empty = document.createElement("div");
+          empty.textContent = "No log files yet.";
+          orbitMcpState.logsBox.appendChild(empty);
+          return;
+        }
+
+        logs.forEach((entry) => {
+          if (!entry || !entry.name) return;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "mcp-log-item";
+          const stamp = entry.mtime_s ? new Date(entry.mtime_s * 1000).toLocaleString() : "";
+          const size = entry.size_bytes != null ? formatBytes(entry.size_bytes) : "";
+          button.textContent = stamp && size ? `${entry.name} (${size}, ${stamp})` : entry.name;
+          button.addEventListener("click", () => fetchOrbitLogContent(entry.name));
+          orbitMcpState.logsBox.appendChild(button);
+        });
+      };
+
+      const fetchOrbitLogContent = async (name) => {
+        if (!orbitMcpState.logContentBox) return;
+        const logName = String(name || "").trim();
+        if (!logName) return;
+        updateSettingsStatus(`Loading log: ${logName}...`);
+        orbitMcpState.logContentBox.textContent = "";
+        try {
+          const response = await fetch(`/api/mcp/orbit/logs/${encodeURIComponent(logName)}?max_bytes=200000`);
+          if (!response.ok) {
+            let detail = "Failed to load log.";
+            try {
+              const err = await response.json();
+              detail = err.detail || detail;
+            } catch (_) {}
+            updateSettingsStatus(detail, true);
+            return;
+          }
+          const data = await response.json();
+          const header = data && data.truncated ? `...(truncated; total ${formatBytes(data.total_bytes)})\n\n` : "";
+          orbitMcpState.logContentBox.textContent = header + (data && data.content ? String(data.content) : "");
+          updateSettingsStatus(`Loaded log: ${logName}`);
+          if (data && data.path) renderOrbitLogPath(data.path);
+        } catch (error) {
+          console.error(error);
+          updateSettingsStatus("Error loading log. See console for details.", true);
+        }
+      };
+
+      const fetchOrbitLogs = async () => {
+        if (!orbitMcpState.logsBox) return;
+        orbitMcpState.logsBox.textContent = "Loading logs...";
+        try {
+          const response = await fetch("/api/mcp/orbit/logs?limit=50");
+          if (!response.ok) {
+            orbitMcpState.logsBox.textContent = "Failed to load logs.";
+            return;
+          }
+          const data = await response.json();
+          renderOrbitLogList(data);
+        } catch (error) {
+          console.warn("Failed to fetch orbit MCP logs.", error);
+          orbitMcpState.logsBox.textContent = "Failed to load logs.";
+        }
+      };
+
+      const fetchOrbitSimStatus = async () => {
+        try {
+          const response = await fetch("/api/mcp/orbit/status");
+          if (!response.ok) return;
+          const data = await response.json();
+          renderOrbitSimStatus(data);
+        } catch (error) {
+          console.warn("Failed to fetch orbit simulation status.", error);
+        }
+      };
+
+      const stopOrbitSim = async () => {
+        if (!orbitMcpState.stopButton) return;
+        orbitMcpState.loading = true;
+        refreshProviderDisabled();
+        updateSettingsStatus("Stopping orbit simulation...");
+        try {
+          const response = await fetch("/api/mcp/orbit/stop", { method: "POST" });
+          if (!response.ok) {
+            let detail = "Failed to stop orbit simulation.";
+            try {
+              const err = await response.json();
+              detail = err.detail || detail;
+            } catch (_) {}
+            updateSettingsStatus(detail, true);
+            return;
+          }
+          const data = await response.json();
+          if (data && data.status) renderOrbitSimStatus(data.status);
+          fetchOrbitLogs();
+          updateSettingsStatus(data && data.stop_requested ? "Stop requested." : "No orbit simulation was running.");
+        } catch (error) {
+          console.error(error);
+          updateSettingsStatus("Error stopping orbit simulation. See console for details.", true);
+        } finally {
+          orbitMcpState.loading = false;
+          refreshProviderDisabled();
+        }
+      };
+
+      const orbitMcpPayloadFromInputs = () => {
+        const server = orbitMcpState.serverInput ? (orbitMcpState.serverInput.value || "").trim() : "";
+        const python = orbitMcpState.pythonInput ? (orbitMcpState.pythonInput.value || "").trim() : "";
+        const protocol = orbitMcpState.protocolInput ? (orbitMcpState.protocolInput.value || "").trim() : "";
+        const framing = orbitMcpState.framingSelect ? (orbitMcpState.framingSelect.value || "").trim() : "ndjson";
+        const timeoutRaw = orbitMcpState.timeoutInput ? (orbitMcpState.timeoutInput.value || "").trim() : "";
+        const timeout = timeoutRaw ? Number(timeoutRaw) : 30;
+        return {
+          server_script: server,
+          python_executable: python,
+          protocol_version: protocol || "2024-11-05",
+          init_timeout_s: Number.isFinite(timeout) ? timeout : 30,
+          framing: framing || "ndjson",
+        };
+      };
+
+      const saveOrbitMcp = async () => {
+        if (!orbitMcpState.serverInput || !orbitMcpState.pythonInput || !orbitMcpState.saveButton) return;
+        const payload = orbitMcpPayloadFromInputs();
+        if (!payload.server_script || !payload.python_executable) {
+          updateSettingsStatus("Provide both a server script and python executable.", true);
+          return;
+        }
+        orbitMcpState.loading = true;
+        refreshProviderDisabled();
+        updateSettingsStatus("Saving MCP settings...");
+        try {
+          const response = await fetch("/api/mcp/orbit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!response.ok) {
+            let detail = "Failed to save MCP settings.";
+            try {
+              const err = await response.json();
+              detail = err.detail || detail;
+            } catch (_) {}
+            updateSettingsStatus(detail, true);
+            return;
+          }
+          const data = await response.json();
+          if (orbitMcpState.serverInput && data.server_script) orbitMcpState.serverInput.value = data.server_script;
+          if (orbitMcpState.pythonInput && data.python_executable) orbitMcpState.pythonInput.value = data.python_executable;
+          if (orbitMcpState.protocolInput && data.protocol_version) orbitMcpState.protocolInput.value = data.protocol_version;
+          if (orbitMcpState.framingSelect && data.framing) orbitMcpState.framingSelect.value = data.framing;
+          if (orbitMcpState.timeoutInput && data.init_timeout_s != null) orbitMcpState.timeoutInput.value = String(data.init_timeout_s);
+          persistOrbitMcp();
+          updateSettingsStatus("MCP settings saved.");
+        } catch (error) {
+          console.error(error);
+          updateSettingsStatus("Error saving MCP settings. See console for details.", true);
+        } finally {
+          orbitMcpState.loading = false;
+          refreshProviderDisabled();
+        }
+      };
+
+      const testOrbitMcp = async () => {
+        if (!orbitMcpState.serverInput || !orbitMcpState.pythonInput || !orbitMcpState.testButton) return;
+        const payload = orbitMcpPayloadFromInputs();
+        if (!payload.server_script || !payload.python_executable) {
+          updateSettingsStatus("Provide both a server script and python executable.", true);
+          return;
+        }
+        orbitMcpState.loading = true;
+        refreshProviderDisabled();
+        updateSettingsStatus("Testing MCP server...");
+        if (orbitMcpState.toolsBox) orbitMcpState.toolsBox.textContent = "";
+        try {
+          const response = await fetch("/api/mcp/orbit/test", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!response.ok) {
+            let detail = "MCP test failed.";
+            try {
+              const err = await response.json();
+              detail = err.detail || detail;
+            } catch (_) {}
+            updateSettingsStatus(detail, true);
+            return;
+          }
+          const data = await response.json();
+          renderOrbitToolList(data);
+          if (data && data.log_path) renderOrbitLogPath(String(data.log_path));
+          fetchOrbitLogs();
+          fetchOrbitSimStatus();
+          if (data && data.log_path) {
+            const logName = String(data.log_path).split("/").pop();
+            if (logName) fetchOrbitLogContent(logName);
+          }
+          updateSettingsStatus(`MCP connected. Tools: ${(data.tools || []).length}`);
+        } catch (error) {
+          console.error(error);
+          updateSettingsStatus("Error testing MCP server. See console for details.", true);
+        } finally {
+          orbitMcpState.loading = false;
+          refreshProviderDisabled();
+        }
+      };
+
+      const initOrbitMcp = () => {
+        orbitMcpState.serverInput = document.getElementById("mcp-orbit-server");
+        orbitMcpState.pythonInput = document.getElementById("mcp-orbit-python");
+        orbitMcpState.protocolInput = document.getElementById("mcp-orbit-protocol");
+        orbitMcpState.framingSelect = document.getElementById("mcp-orbit-framing");
+        orbitMcpState.timeoutInput = document.getElementById("mcp-orbit-timeout");
+        orbitMcpState.saveButton = document.getElementById("save-mcp-orbit");
+        orbitMcpState.testButton = document.getElementById("test-mcp-orbit");
+        orbitMcpState.stopButton = document.getElementById("stop-mcp-orbit");
+        orbitMcpState.toolsBox = document.getElementById("mcp-orbit-tools");
+        orbitMcpState.simStatusBox = document.getElementById("mcp-orbit-sim-status");
+        orbitMcpState.logPathBox = document.getElementById("mcp-orbit-log-path");
+        orbitMcpState.logsBox = document.getElementById("mcp-orbit-logs");
+        orbitMcpState.logContentBox = document.getElementById("mcp-orbit-log-content");
+        orbitMcpState.refreshLogsButton = document.getElementById("refresh-mcp-orbit-logs");
+
+        if (!orbitMcpState.serverInput || !orbitMcpState.pythonInput || !orbitMcpState.protocolInput || !orbitMcpState.framingSelect || !orbitMcpState.timeoutInput || !orbitMcpState.saveButton || !orbitMcpState.testButton) {
+          console.warn("Orbit MCP configuration elements missing from the page.");
+          return;
+        }
+
+        const storedServer = localStorage.getItem(orbitMcpStorage.server);
+        const storedPython = localStorage.getItem(orbitMcpStorage.python);
+        const storedProtocol = localStorage.getItem(orbitMcpStorage.protocol);
+        const storedFraming = localStorage.getItem(orbitMcpStorage.framing);
+        const storedTimeout = localStorage.getItem(orbitMcpStorage.timeout);
+        if (storedServer) orbitMcpState.serverInput.value = storedServer;
+        if (storedPython) orbitMcpState.pythonInput.value = storedPython;
+        if (storedProtocol) orbitMcpState.protocolInput.value = storedProtocol;
+        if (storedFraming) orbitMcpState.framingSelect.value = storedFraming;
+        if (storedTimeout) orbitMcpState.timeoutInput.value = storedTimeout;
+
+        orbitMcpState.serverInput.addEventListener("input", () => {
+          persistOrbitMcp();
+          refreshProviderDisabled();
+        });
+        orbitMcpState.pythonInput.addEventListener("input", () => {
+          persistOrbitMcp();
+          refreshProviderDisabled();
+        });
+        orbitMcpState.protocolInput.addEventListener("input", () => {
+          persistOrbitMcp();
+          refreshProviderDisabled();
+        });
+        orbitMcpState.framingSelect.addEventListener("change", () => {
+          persistOrbitMcp();
+          refreshProviderDisabled();
+        });
+        orbitMcpState.timeoutInput.addEventListener("input", () => {
+          persistOrbitMcp();
+          refreshProviderDisabled();
+        });
+
+        orbitMcpState.saveButton.addEventListener("click", () => saveOrbitMcp());
+        orbitMcpState.testButton.addEventListener("click", () => testOrbitMcp());
+        if (orbitMcpState.refreshLogsButton) orbitMcpState.refreshLogsButton.addEventListener("click", () => fetchOrbitLogs());
+        if (orbitMcpState.stopButton) orbitMcpState.stopButton.addEventListener("click", () => stopOrbitSim());
+        fetchOrbitLogs();
+        fetchOrbitSimStatus();
+      };
+
       const loadInitialEmbeddings = async () => {
         try {
           const response = await fetch("/api/embeddings");
@@ -625,9 +1334,38 @@ HTML_PAGE = """<!DOCTYPE html>
         }
       };
 
+      const loadInitialOrbitMcp = async () => {
+        try {
+          const response = await fetch("/api/mcp/orbit");
+          if (!response.ok) return;
+          const payload = await response.json();
+          if (!payload) return;
+
+          if (orbitMcpState.serverInput && payload.server_script && !localStorage.getItem(orbitMcpStorage.server)) {
+            orbitMcpState.serverInput.value = payload.server_script;
+          }
+          if (orbitMcpState.pythonInput && payload.python_executable && !localStorage.getItem(orbitMcpStorage.python)) {
+            orbitMcpState.pythonInput.value = payload.python_executable;
+          }
+          if (orbitMcpState.protocolInput && payload.protocol_version && !localStorage.getItem(orbitMcpStorage.protocol)) {
+            orbitMcpState.protocolInput.value = payload.protocol_version;
+          }
+          if (orbitMcpState.framingSelect && payload.framing && !localStorage.getItem(orbitMcpStorage.framing)) {
+            orbitMcpState.framingSelect.value = payload.framing;
+          }
+          if (orbitMcpState.timeoutInput && payload.init_timeout_s != null && !localStorage.getItem(orbitMcpStorage.timeout)) {
+            orbitMcpState.timeoutInput.value = String(payload.init_timeout_s);
+          }
+        } catch (error) {
+          console.warn("Failed to load initial MCP configuration.", error);
+        }
+      };
+
       PROVIDERS.forEach(initProvider);
       initEmbeddings();
+      initOrbitMcp();
       loadInitialEmbeddings();
+      loadInitialOrbitMcp();
       refreshProviderDisabled();
 
       const toggleSettings = () => {
@@ -730,7 +1468,7 @@ HTML_PAGE = """<!DOCTYPE html>
         }
       });
 
-      const resetChat = (message = "NOS3 RAG assistant ready. Ask me about the documentation.") => {
+      const resetChat = (message = "Sat.AI assistant ready. Ask me about the documentation (tip: /orbit <lat> <lon> launches the orbit visualization).") => {
         history = [];
         log.innerHTML = "";
         appendMessage("assistant", message);
@@ -796,6 +1534,54 @@ class EmbeddingSettingsRequest(BaseModel):
     ollama_url: Optional[str] = None
     embedding_model: Optional[str] = None
     rebuild: bool = True
+
+
+class OrbitMcpSettings(BaseModel):
+    python_executable: str = Field(..., min_length=1)
+    server_script: str = Field(..., min_length=1)
+    protocol_version: str = Field("2024-11-05", min_length=1)
+    init_timeout_s: float = Field(30.0, ge=0.1, le=300.0)
+    framing: str = Field("ndjson", min_length=1)
+
+
+class OrbitMcpTestResponse(BaseModel):
+    server_info: Dict[str, Any] = Field(default_factory=dict)
+    protocol_version: str | None = None
+    tools: List[Dict[str, Any]] = Field(default_factory=list)
+    log_path: str | None = None
+
+
+class OrbitMcpLogEntry(BaseModel):
+    name: str
+    path: str
+    size_bytes: int
+    mtime_s: float
+
+
+class OrbitMcpLogsResponse(BaseModel):
+    directory: str
+    logs: List[OrbitMcpLogEntry] = Field(default_factory=list)
+
+
+class OrbitMcpLogContentResponse(BaseModel):
+    name: str
+    path: str
+    truncated: bool = False
+    total_bytes: int = 0
+    content: str = ""
+
+
+class OrbitMcpSimStatusResponse(BaseModel):
+    running: bool = False
+    pid: int | None = None
+    log_path: str | None = None
+    run_dir: str | None = None
+    started_s: float | None = None
+
+
+class OrbitMcpStopResponse(BaseModel):
+    stop_requested: bool = False
+    status: OrbitMcpSimStatusResponse = Field(default_factory=OrbitMcpSimStatusResponse)
 
 
 class ModelSelectionError(Exception):
@@ -1054,7 +1840,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app(config: WebConfig) -> FastAPI:
-    app = FastAPI(title="NOS3 RAG Chat", version="0.1.0")
+    app = FastAPI(title="Sat.AI", version="0.1.0")
 
     app.state.config = config
     app.state.vector_store: Chroma | None = None
@@ -1184,8 +1970,402 @@ def create_app(config: WebConfig) -> FastAPI:
 
         return EmbeddingSettings(ollama_url=url, embedding_model=model)
 
+    @app.get("/api/mcp/orbit", response_model=OrbitMcpSettings)
+    def get_orbit_mcp() -> OrbitMcpSettings:
+        return OrbitMcpSettings(
+            python_executable=app.state.config.orbit_mcp_python,
+            server_script=_format_repo_path(app.state.config.orbit_mcp_server),
+            protocol_version=app.state.config.orbit_mcp_protocol_version,
+            init_timeout_s=app.state.config.orbit_mcp_init_timeout_s,
+            framing=app.state.config.orbit_mcp_framing,
+        )
+
+    @app.post("/api/mcp/orbit", response_model=OrbitMcpSettings)
+    def set_orbit_mcp(request: OrbitMcpSettings) -> OrbitMcpSettings:
+        python_executable = request.python_executable.strip()
+        server_script = request.server_script.strip()
+        protocol_version = request.protocol_version.strip()
+        init_timeout_s = float(request.init_timeout_s)
+        framing = (request.framing or "").strip().lower()
+
+        if not python_executable:
+            raise HTTPException(status_code=400, detail="python_executable cannot be empty.")
+        if not server_script:
+            raise HTTPException(status_code=400, detail="server_script cannot be empty.")
+        if not protocol_version:
+            raise HTTPException(status_code=400, detail="protocol_version cannot be empty.")
+        if framing not in {"ndjson", "lsp"}:
+            raise HTTPException(status_code=400, detail="framing must be either 'ndjson' or 'lsp'.")
+
+        server_path = _resolve_repo_path(server_script)
+
+        app.state.config.orbit_mcp_python = python_executable
+        app.state.config.orbit_mcp_server = server_path
+        app.state.config.orbit_mcp_protocol_version = protocol_version
+        app.state.config.orbit_mcp_init_timeout_s = init_timeout_s
+        app.state.config.orbit_mcp_framing = framing
+
+        return get_orbit_mcp()
+
+    @app.post("/api/mcp/orbit/test", response_model=OrbitMcpTestResponse)
+    async def test_orbit_mcp(request: OrbitMcpSettings) -> OrbitMcpTestResponse:
+        python_executable = request.python_executable.strip()
+        server_script = request.server_script.strip()
+        protocol_version = request.protocol_version.strip()
+        init_timeout_s = float(request.init_timeout_s)
+        framing = (request.framing or "").strip().lower()
+
+        if not python_executable:
+            raise HTTPException(status_code=400, detail="python_executable cannot be empty.")
+        if not server_script:
+            raise HTTPException(status_code=400, detail="server_script cannot be empty.")
+        if not protocol_version:
+            raise HTTPException(status_code=400, detail="protocol_version cannot be empty.")
+        if framing not in {"ndjson", "lsp"}:
+            raise HTTPException(status_code=400, detail="framing must be either 'ndjson' or 'lsp'.")
+
+        server_path = _resolve_repo_path(server_script)
+
+        config = OrbitMCPConfig(
+            python_executable=python_executable,
+            server_script=server_path,
+            protocol_version=protocol_version,
+            init_timeout_s=init_timeout_s,
+            framing=framing,
+        )
+
+        log_path = new_orbit_mcp_log_path("orbit_mcp_test", log_dir=default_orbit_mcp_log_dir())
+        try:
+            result = await run_in_threadpool(test_connection, config=config, log_path=log_path)
+        except OrbitMCPError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        initialize_result = result.get("initialize") if isinstance(result, dict) else None
+        tools = result.get("tools") if isinstance(result, dict) else None
+
+        server_info: Dict[str, Any] = {}
+        protocol: str | None = None
+        if isinstance(initialize_result, dict):
+            raw_server_info = initialize_result.get("serverInfo")
+            if isinstance(raw_server_info, dict):
+                server_info = raw_server_info
+            raw_protocol = initialize_result.get("protocolVersion")
+            if isinstance(raw_protocol, str) and raw_protocol.strip():
+                protocol = raw_protocol.strip()
+
+        tools_list: List[Dict[str, Any]] = []
+        if isinstance(tools, list):
+            tools_list = [item for item in tools if isinstance(item, dict)]
+
+        # Persist tested config for subsequent /orbit calls.
+        app.state.config.orbit_mcp_python = python_executable
+        app.state.config.orbit_mcp_server = server_path
+        app.state.config.orbit_mcp_protocol_version = protocol_version
+        app.state.config.orbit_mcp_init_timeout_s = init_timeout_s
+        app.state.config.orbit_mcp_framing = framing
+
+        return OrbitMcpTestResponse(
+            server_info=server_info,
+            protocol_version=protocol,
+            tools=tools_list,
+            log_path=_format_repo_path(log_path),
+        )
+
+    @app.get("/api/mcp/orbit/logs", response_model=OrbitMcpLogsResponse)
+    def list_orbit_mcp_logs(limit: int = 50) -> OrbitMcpLogsResponse:
+        if limit < 1:
+            raise HTTPException(status_code=400, detail="limit must be >= 1.")
+        if limit > 200:
+            raise HTTPException(status_code=400, detail="limit must be <= 200.")
+
+        log_dir = default_orbit_mcp_log_dir()
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Failed to create log directory: {exc}") from exc
+
+        entries: List[OrbitMcpLogEntry] = []
+        for path in sorted(log_dir.glob("*.log")):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append(
+                OrbitMcpLogEntry(
+                    name=path.name,
+                    path=_format_repo_path(path),
+                    size_bytes=int(stat.st_size),
+                    mtime_s=float(stat.st_mtime),
+                )
+            )
+
+        entries.sort(key=lambda entry: entry.mtime_s, reverse=True)
+        return OrbitMcpLogsResponse(directory=_format_repo_path(log_dir), logs=entries[:limit])
+
+    @app.get("/api/mcp/orbit/logs/{name}", response_model=OrbitMcpLogContentResponse)
+    def read_orbit_mcp_log(name: str, max_bytes: int = 200_000) -> OrbitMcpLogContentResponse:
+        if not name or "/" in name or "\\" in name or "\x00" in name or ".." in name:
+            raise HTTPException(status_code=400, detail="Invalid log name.")
+        if max_bytes < 100:
+            raise HTTPException(status_code=400, detail="max_bytes must be >= 100.")
+        if max_bytes > 5_000_000:
+            raise HTTPException(status_code=400, detail="max_bytes must be <= 5,000,000.")
+
+        log_dir = default_orbit_mcp_log_dir()
+        path = (log_dir / name).resolve()
+        try:
+            # Prevent path traversal; require file to be within the log directory.
+            path.relative_to(log_dir.resolve())
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid log path.")
+
+        if not path.exists() or not path.is_file():
+            raise HTTPException(status_code=404, detail="Log file not found.")
+
+        try:
+            total_bytes = path.stat().st_size
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to stat log file: {exc}") from exc
+
+        truncated = False
+        data: bytes
+        try:
+            with open(path, "rb") as handle:
+                if total_bytes > max_bytes:
+                    truncated = True
+                    try:
+                        handle.seek(-max_bytes, os.SEEK_END)
+                    except OSError:
+                        handle.seek(0)
+                    data = handle.read(max_bytes)
+                else:
+                    data = handle.read()
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to read log file: {exc}") from exc
+
+        content = data.decode("utf-8", errors="replace")
+        return OrbitMcpLogContentResponse(
+            name=path.name,
+            path=_format_repo_path(path),
+            truncated=truncated,
+            total_bytes=int(total_bytes),
+            content=content,
+        )
+
+    @app.get("/api/mcp/orbit/status", response_model=OrbitMcpSimStatusResponse)
+    def orbit_sim_status() -> OrbitMcpSimStatusResponse:
+        status = get_active_orbit_simulation()
+        raw_log_path = status.get("log_path")
+        log_path: str | None = None
+        if isinstance(raw_log_path, str) and raw_log_path.strip():
+            try:
+                log_path = _format_repo_path(Path(raw_log_path))
+            except Exception:
+                log_path = raw_log_path
+
+        raw_run_dir = status.get("run_dir")
+        run_dir: str | None = None
+        if isinstance(raw_run_dir, str) and raw_run_dir.strip():
+            try:
+                run_dir = _format_repo_path(Path(raw_run_dir))
+            except Exception:
+                run_dir = raw_run_dir
+
+        pid = status.get("pid") if isinstance(status.get("pid"), int) else None
+        started_s = status.get("started_s")
+        started_s_value: float | None = None
+        if isinstance(started_s, (int, float)):
+            started_s_value = float(started_s)
+
+        return OrbitMcpSimStatusResponse(
+            running=bool(status.get("running")),
+            pid=pid,
+            log_path=log_path,
+            run_dir=run_dir,
+            started_s=started_s_value,
+        )
+
+    @app.post("/api/mcp/orbit/stop", response_model=OrbitMcpStopResponse)
+    def orbit_sim_stop() -> OrbitMcpStopResponse:
+        requested = stop_active_orbit_simulation()
+        return OrbitMcpStopResponse(stop_requested=requested, status=orbit_sim_status())
+
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(payload: ChatRequest) -> ChatResponse:
+        message = payload.message.strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+        history = list(payload.history)
+        chat_history = [(turn.question, turn.answer) for turn in history]
+
+        if is_orbit_command(message):
+            orbit_args = parse_orbit_command(message)
+            if orbit_args is None:
+                answer = "Usage: /orbit <latitude> <longitude> (example: /orbit 40.7128 -74.0060)"
+                updated_history = history + [ChatTurn(question=message, answer=answer)]
+                return ChatResponse(
+                    answer=answer,
+                    sources=[],
+                    history=updated_history,
+                    provider="MCP",
+                    model="visualize_orbit",
+                    provider_id="satellite-sim",
+                )
+
+            lat, lon = orbit_args
+            try:
+                answer, _run_dir_text, _log_path_text = _start_orbit_from_chat(app.state.config, lat, lon)
+            except OrbitMCPError as exc:
+                answer = f"Orbit visualization failed to start: {exc}"
+            updated_history = history + [ChatTurn(question=message, answer=answer)]
+            return ChatResponse(
+                answer=answer,
+                sources=[],
+                history=updated_history,
+                provider="MCP",
+                model="visualize_orbit",
+                provider_id="satellite-sim",
+            )
+
+        if _should_attempt_orbit_nl_routing(message, history):
+            coords = _extract_lat_lon_from_text(message)
+            request_model_overrides = {
+                (name or "").strip().lower(): value.strip()
+                for name, value in (payload.provider_models or {}).items()
+                if name and isinstance(name, str) and isinstance(value, str) and value.strip()
+            }
+
+            key_map = {
+                "cerebras": (payload.cerebras_api_key or "").strip() or (app.state.config.cerebras_api_key or "").strip(),
+                "groq": (payload.groq_api_key or "").strip() or (app.state.config.groq_api_key or "").strip(),
+                "sambanova": (payload.sambanova_api_key or "").strip() or (app.state.config.sambanova_api_key or "").strip(),
+            }
+
+            router_provider: str | None = None
+            router_model: str | None = None
+            decision: dict[str, Any] | None = None
+
+            for provider_name in ("cerebras", "groq", "sambanova"):
+                key_value = key_map.get(provider_name) or ""
+                if not key_value:
+                    continue
+                model_value = request_model_overrides.get(provider_name) or _select_router_model(
+                    app.state.config, app.state.selected_models, provider_name
+                )
+                if not model_value:
+                    continue
+                try:
+                    llm = _create_router_llm(provider_name, model_value, key_value)
+                except Exception:
+                    continue
+                decision = await run_in_threadpool(_route_orbit_request_with_llm, llm, message)
+                router_provider = provider_name
+                router_model = model_value
+                if decision is not None:
+                    break
+
+            action = (decision.get("action") if isinstance(decision, dict) else None) or ""
+            action = str(action).strip().lower()
+
+            if action == "orbit":
+                lat = decision.get("latitude") if isinstance(decision, dict) else None
+                lon = decision.get("longitude") if isinstance(decision, dict) else None
+                try:
+                    lat_f = float(lat)
+                    lon_f = float(lon)
+                except Exception:
+                    lat_f = lon_f = None  # type: ignore[assignment]
+
+                if isinstance(lat_f, float) and isinstance(lon_f, float) and -90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0:
+                    try:
+                        answer, _run_dir_text, _log_path_text = _start_orbit_from_chat(app.state.config, lat_f, lon_f)
+                    except OrbitMCPError as exc:
+                        answer = f"Orbit visualization failed to start: {exc}"
+                    updated_history = history + [ChatTurn(question=message, answer=answer)]
+                    return ChatResponse(
+                        answer=answer,
+                        sources=[],
+                        history=updated_history,
+                        provider="MCP",
+                        model="visualize_orbit",
+                        provider_id="satellite-sim",
+                    )
+
+                if coords is not None:
+                    lat_f, lon_f = coords
+                    try:
+                        answer, _run_dir_text, _log_path_text = _start_orbit_from_chat(app.state.config, lat_f, lon_f)
+                    except OrbitMCPError as exc:
+                        answer = f"Orbit visualization failed to start: {exc}"
+                    updated_history = history + [ChatTurn(question=message, answer=answer)]
+                    return ChatResponse(
+                        answer=answer,
+                        sources=[],
+                        history=updated_history,
+                        provider="MCP",
+                        model="visualize_orbit",
+                        provider_id="satellite-sim",
+                    )
+
+                hint = "To run the orbit simulation, include a target latitude and longitude (degrees), e.g. `/orbit 20 -110`."
+                question = (decision.get("question") if isinstance(decision, dict) else None) or hint
+                answer = f"{str(question).strip()}\n{hint}"
+                updated_history = history + [ChatTurn(question=message, answer=answer)]
+                provider_label = PROVIDER_LABELS.get(router_provider or "", router_provider) if router_provider else None
+                return ChatResponse(
+                    answer=answer,
+                    sources=[],
+                    history=updated_history,
+                    provider=provider_label,
+                    model=router_model,
+                    provider_id="orbit-router",
+                )
+
+            if action == "clarify":
+                hint = "To run the orbit simulation, include a target latitude and longitude (degrees), e.g. `/orbit 20 -110`."
+                question = (decision.get("question") if isinstance(decision, dict) else None) or hint
+                answer = f"{str(question).strip()}\n{hint}"
+                updated_history = history + [ChatTurn(question=message, answer=answer)]
+                provider_label = PROVIDER_LABELS.get(router_provider or "", router_provider) if router_provider else None
+                return ChatResponse(
+                    answer=answer,
+                    sources=[],
+                    history=updated_history,
+                    provider=provider_label,
+                    model=router_model,
+                    provider_id="orbit-router",
+                )
+
+            if coords is not None and any(keyword in message.lower() for keyword in _ORBIT_CONTEXT_KEYWORDS):
+                lat_f, lon_f = coords
+                try:
+                    answer, _run_dir_text, _log_path_text = _start_orbit_from_chat(app.state.config, lat_f, lon_f)
+                except OrbitMCPError as exc:
+                    answer = f"Orbit visualization failed to start: {exc}"
+                updated_history = history + [ChatTurn(question=message, answer=answer)]
+                return ChatResponse(
+                    answer=answer,
+                    sources=[],
+                    history=updated_history,
+                    provider="MCP",
+                    model="visualize_orbit",
+                    provider_id="satellite-sim",
+                )
+
+            if coords is None:
+                hint = "To run the orbit simulation, include a target latitude and longitude (degrees), e.g. `/orbit 20 -110`."
+                answer = f"{hint}"
+                updated_history = history + [ChatTurn(question=message, answer=answer)]
+                return ChatResponse(
+                    answer=answer,
+                    sources=[],
+                    history=updated_history,
+                    provider="MCP",
+                    model="visualize_orbit",
+                    provider_id="satellite-sim",
+                )
+
         if app.state.startup_error:
             raise HTTPException(status_code=500, detail=app.state.startup_error)
         if app.state.vector_store is None:
@@ -1193,13 +2373,6 @@ def create_app(config: WebConfig) -> FastAPI:
                 status_code=503,
                 detail="Knowledge base is still initializing. Try again shortly.",
             )
-
-        message = payload.message.strip()
-        if not message:
-            raise HTTPException(status_code=400, detail="Message cannot be empty.")
-
-        history = list(payload.history)
-        chat_history = [(turn.question, turn.answer) for turn in history]
 
         def add_key(provider: str, key: str | None) -> None:
             if not key:
@@ -1434,6 +2607,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _env_path(name: str, default: Path) -> Path:
     raw = os.getenv(name)
     if not raw:
@@ -1496,6 +2679,16 @@ def load_config_from_env() -> WebConfig:
 
     ollama_url = _normalize_ollama_url(os.getenv("SAT_WEB_OLLAMA_URL", DEFAULT_OLLAMA_URL))
 
+    orbit_server_raw = os.getenv("SAT_ORBIT_MCP_SERVER")
+    orbit_server_default = _REPO_ROOT / "SAT_Orbit_Sim_MCP" / "satellite_server.py"
+    orbit_server = _resolve_repo_path(orbit_server_raw) if orbit_server_raw else orbit_server_default
+    orbit_python = os.getenv("SAT_ORBIT_MCP_PYTHON", sys.executable)
+    orbit_protocol = os.getenv("SAT_ORBIT_MCP_PROTOCOL_VERSION", "2024-11-05")
+    orbit_timeout = _env_float("SAT_ORBIT_MCP_INIT_TIMEOUT_S", 30.0)
+    orbit_framing = (os.getenv("SAT_ORBIT_MCP_FRAMING", "ndjson") or "ndjson").strip().lower()
+    if orbit_framing not in {"ndjson", "lsp"}:
+        orbit_framing = "ndjson"
+
     return WebConfig(
         host=os.getenv("SAT_WEB_HOST", "0.0.0.0"),
         port=_env_int("SAT_WEB_PORT", 8000),
@@ -1515,11 +2708,16 @@ def load_config_from_env() -> WebConfig:
         cerebras_models=cerebras_models,
         groq_models=groq_models,
         sambanova_models=sambanova_models,
+        orbit_mcp_python=orbit_python,
+        orbit_mcp_server=orbit_server,
+        orbit_mcp_protocol_version=orbit_protocol,
+        orbit_mcp_init_timeout_s=orbit_timeout,
+        orbit_mcp_framing=orbit_framing,
     )
 
 
 def parse_args(defaults: WebConfig) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Launch the NOS3 RAG chat web interface.")
+    parser = argparse.ArgumentParser(description="Launch the Sat.AI web interface.")
     parser.add_argument("--host", default=defaults.host, help="Host interface for the web server.")
     parser.add_argument("--port", type=int, default=defaults.port, help="Port for the web server.")
     parser.add_argument("--reload", action="store_true", default=defaults.reload, help="Enable autoreload (development only).")

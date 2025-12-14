@@ -14,6 +14,7 @@ Retrieval-augmented chat assistant that answers questions about the NASA Operati
 - Cerebras Inference API key available as the `CEREBRAS_API_KEY` environment variable
 - Internet access on first run (or whenever rebuilding the document index)
 - Dependencies listed in `requirements.txt`
+- (Optional) A local GUI + additional deps for the orbit visualization (`requirements-orbit-sim.txt`)
 
 ## Quick Start
 ```bash
@@ -36,6 +37,31 @@ python web_chat.py
 The FastAPI server defaults to `http://0.0.0.0:8000/` and serves a lightweight UI that keeps the conversation history client-side. Open the **Settings** drawer to enter your Cerebras, Groq, and SambaNova API keys, refresh the live model list from each provider, and pick the exact alias you want to route to—each key/model choice can be remembered locally per browser. The backend automatically round-robins across every working key, always targeting the `gpt-oss-120b` family while transparently falling back to the provider-specific aliases you select, and any invalid key/model pair is dropped from the rotation. Use the **New Chat** button to clear the conversation history, and enjoy Markdown-aware rendering for tables, code blocks, and inline formatting. All vector store and model parameters mirror the CLI defaults; override them with flags (for example, `--port 8080 --reload`) or export environment variables such as `SAT_WEB_PERSIST_DIR`, `SAT_WEB_SOURCE_URL`, `SAT_WEB_REBUILD=1`, `SAT_WEB_CEREBRAS_KEY`, `SAT_WEB_GROQ_KEY`, `SAT_WEB_SAMBANOVA_KEY`, `SAT_WEB_CEREBRAS_MODELS`, `SAT_WEB_GROQ_MODELS`, or `SAT_WEB_SAMBANOVA_MODELS` before launching.
 
 ---
+
+## Orbit Visualization (MCP)
+
+This repo includes an MCP server under `SAT_Orbit_Sim_MCP/` that can launch a Matplotlib orbit visualization for a target latitude/longitude.
+
+Install optional dependencies:
+```bash
+pip install -r requirements.txt -r requirements-orbit-sim.txt
+```
+
+Then, from either the CLI chat or the web UI, run:
+```text
+/orbit <latitude> <longitude>
+```
+
+You can also ask in natural language (web UI), for example:
+```text
+Run the orbit sim with target 20 -110
+```
+
+Notes:
+- The visualization window opens on the machine running `web_chat.py` / `rag_chat.py` (it is not rendered in-browser).
+- In `rag_chat.py` the `/orbit` command blocks until you close the window; in `web_chat.py` it runs in the background so the UI stays responsive.
+- Override the server script path with `SAT_ORBIT_MCP_SERVER` if needed.
+- Override the TLE source (path or URL) with `SAT_ORBIT_TLE_SOURCE` (defaults to `SAT_Orbit_Sim_MCP/stations.txt` when present).
 
 ## Running via Docker
 
