@@ -1,0 +1,4 @@
+fastmcp
+skyfield
+matplotlib
+numpy
