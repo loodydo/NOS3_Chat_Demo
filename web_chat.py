@@ -8,8 +8,10 @@ import argparse
 import json
 import os
 import re
+import secrets
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
@@ -54,6 +56,9 @@ from orbit_mcp import (
     test_connection,
 )
 
+from remote_mcp import RemoteMCPError, RemoteMCPServerConfig, call_tool_text as remote_call_tool_text
+from remote_mcp import test_connection as test_remote_mcp_connection
+
 
 _FLOAT_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)")
 
@@ -73,6 +78,9 @@ _ORBIT_INTENT_KEYWORDS = (
 
 _ORBIT_CONTEXT_KEYWORDS = ("orbit", "satellite", "iss", "target", "latitude", "longitude", "lat", "lon")
 _ORBIT_ACTION_KEYWORDS = ("run", "start", "launch", "simulate", "visualize", "show", "plot", "animate")
+
+_REMOTE_MCP_INTENT_KEYWORDS = ("mcp", "tool", "tools", "server", "servers", "endpoint", "sse")
+_REMOTE_MCP_ACTION_KEYWORDS = ("run", "call", "use", "execute", "invoke", "start", "trigger")
 
 
 def _extract_lat_lon_from_text(text: str) -> tuple[float, float] | None:
@@ -111,6 +119,42 @@ def _should_attempt_orbit_nl_routing(message: str, history: list["ChatTurn"]) ->
         last = (history[-1].answer or "").lower()
         if "orbit" in last and ("latitude" in last or "longitude" in last or "/orbit" in last):
             return True
+    return False
+
+
+def _should_attempt_remote_mcp_routing(
+    message: str,
+    history: list["ChatTurn"],
+    remote_servers: list[dict[str, Any]],
+) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    if text.startswith("/"):
+        return False
+    if not remote_servers:
+        return False
+    if is_orbit_command(text) or _should_attempt_orbit_nl_routing(message, history):
+        return False
+
+    if any(keyword in text for keyword in _REMOTE_MCP_INTENT_KEYWORDS):
+        return True
+    if any(text.startswith(keyword + " ") for keyword in _REMOTE_MCP_ACTION_KEYWORDS):
+        return True
+
+    for server in remote_servers:
+        server_name = str(server.get("name") or "").strip().lower()
+        if server_name and server_name in text:
+            return True
+        tools = server.get("tools")
+        if not isinstance(tools, list):
+            continue
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_name = str(tool.get("name") or "").strip().lower()
+            if tool_name and tool_name in text:
+                return True
     return False
 
 
@@ -185,6 +229,132 @@ def _route_orbit_request_with_llm(llm, message: str) -> dict[str, Any] | None:
             "Rules:\n"
             "- Only output JSON. No markdown, no backticks, no extra text.\n"
             "- Latitude must be between -90 and 90. Longitude between -180 and 180.\n"
+        )
+    )
+    human = HumanMessage(content=message)
+    try:
+        response = llm.invoke([system, human])
+    except Exception:
+        return None
+    content = getattr(response, "content", None)
+    if content is None:
+        content = str(response)
+    return _parse_json_object(str(content))
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _summarize_json_schema(schema: Any) -> str:
+    if not isinstance(schema, dict):
+        return ""
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or not properties:
+        return ""
+    required_raw = schema.get("required")
+    required = {item for item in required_raw if isinstance(item, str)} if isinstance(required_raw, list) else set()
+
+    parts: list[str] = []
+    for key, spec in properties.items():
+        if not isinstance(key, str):
+            continue
+        type_name = "any"
+        desc = ""
+        if isinstance(spec, dict):
+            if isinstance(spec.get("type"), str):
+                type_name = spec["type"]
+            elif isinstance(spec.get("anyOf"), list):
+                types: list[str] = []
+                for option in spec.get("anyOf") or []:
+                    if isinstance(option, dict) and isinstance(option.get("type"), str):
+                        types.append(option["type"])
+                if types:
+                    type_name = "|".join(sorted(set(types)))
+            if isinstance(spec.get("description"), str):
+                desc = _truncate_text(spec["description"], 60)
+        marker = "*" if key in required else ""
+        if desc:
+            parts.append(f"{key}{marker}:{type_name} ({desc})")
+        else:
+            parts.append(f"{key}{marker}:{type_name}")
+        if len(parts) >= 8:
+            parts.append("…")
+            break
+    return ", ".join(parts).strip()
+
+
+def _summarize_remote_mcp_tools_for_prompt(remote_servers: list[dict[str, Any]], *, max_tools: int = 60) -> str:
+    lines: list[str] = []
+    tool_count = 0
+    for server in remote_servers:
+        server_id = str(server.get("id") or "").strip()
+        server_name = str(server.get("name") or server_id or "server").strip()
+        server_url = str(server.get("url") or "").strip()
+        header = f"Server: {server_name} (id={server_id}"
+        if server_url:
+            header += f", url={server_url}"
+        header += ")"
+        lines.append(header)
+
+        tools = server.get("tools")
+        if not isinstance(tools, list) or not tools:
+            lines.append("  (no tools cached)")
+            continue
+
+        for tool in tools:
+            if tool_count >= max_tools:
+                lines.append("  …(more tools not shown)")
+                return "\n".join(lines).strip()
+            if not isinstance(tool, dict):
+                continue
+            tool_name = str(tool.get("name") or "").strip()
+            if not tool_name:
+                continue
+            desc = _truncate_text(str(tool.get("description") or ""), 120)
+            schema = tool.get("inputSchema")
+            if schema is None:
+                schema = tool.get("input_schema")
+            args_summary = _summarize_json_schema(schema)
+            entry = f"  - {tool_name}"
+            if desc:
+                entry += f": {desc}"
+            if args_summary:
+                entry += f" (args: {args_summary})"
+            lines.append(entry)
+            tool_count += 1
+
+    return "\n".join(lines).strip()
+
+
+def _route_remote_mcp_request_with_llm(llm, message: str, remote_servers: list[dict[str, Any]]) -> dict[str, Any] | None:
+    tools_summary = _summarize_remote_mcp_tools_for_prompt(remote_servers)
+    if not tools_summary:
+        return None
+    system = SystemMessage(
+        content=(
+            "You are a router for Sat.AI.\n"
+            "Sat.AI can either:\n"
+            "1) Answer questions about the NOS3 documentation.\n"
+            "2) Call a tool on a remote MCP server (listed below).\n\n"
+            "Available remote MCP tools:\n"
+            f"{tools_summary}\n\n"
+            "Decide what to do for the user's message.\n"
+            "- If the user is asking to call/run one of the tools above, output ONLY valid JSON:\n"
+            '  {"action":"mcp","server_id":"<id>","tool_name":"<name>","arguments":{...}}\n'
+            "- If they want a tool but required arguments are missing/unclear, output ONLY valid JSON:\n"
+            '  {"action":"clarify","question":"<ask for the missing inputs>"}\n'
+            "- Otherwise output ONLY valid JSON:\n"
+            '  {"action":"chat"}\n\n'
+            "Rules:\n"
+            "- Only output JSON. No markdown, no backticks, no extra text.\n"
+            "- Never invent server_id or tool_name.\n"
+            "- arguments must be a JSON object (use {} if the tool takes no arguments).\n"
         )
     )
     human = HumanMessage(content=message)
@@ -307,6 +477,8 @@ class WebConfig:
 
 
 _REPO_ROOT = Path(__file__).resolve().parent
+_REMOTE_MCP_REGISTRY_PATH = _REPO_ROOT / "storage" / "remote_mcp_servers.json"
+_REMOTE_MCP_REGISTRY_LOCK = threading.Lock()
 
 
 def _resolve_repo_path(raw: str) -> Path:
@@ -321,6 +493,80 @@ def _format_repo_path(path: Path) -> str:
         return str(path.resolve().relative_to(_REPO_ROOT))
     except Exception:
         return str(path)
+
+
+def _load_remote_mcp_registry(path: Path) -> Dict[str, Dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+    servers_raw: Any = raw
+    if isinstance(raw, dict) and isinstance(raw.get("servers"), list):
+        servers_raw = raw.get("servers")
+
+    if not isinstance(servers_raw, list):
+        return {}
+
+    registry: Dict[str, Dict[str, Any]] = {}
+    for item in servers_raw:
+        if not isinstance(item, dict):
+            continue
+        server_id = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not server_id or not name or not url:
+            continue
+        protocol_version = str(item.get("protocol_version") or "2024-11-05").strip() or "2024-11-05"
+        try:
+            init_timeout_s = float(item.get("init_timeout_s") or 30.0)
+        except Exception:
+            init_timeout_s = 30.0
+        init_timeout_s = max(0.1, min(300.0, init_timeout_s))
+        enabled = bool(item.get("enabled", True))
+
+        tools = item.get("tools")
+        if not isinstance(tools, list):
+            tools = []
+
+        last_test_s_raw = item.get("last_test_s")
+        last_test_s = float(last_test_s_raw) if isinstance(last_test_s_raw, (int, float)) else None
+
+        last_error_raw = item.get("last_error")
+        last_error = str(last_error_raw) if isinstance(last_error_raw, str) and last_error_raw.strip() else None
+
+        registry[server_id] = {
+            "id": server_id,
+            "name": name,
+            "url": url,
+            "protocol_version": protocol_version,
+            "init_timeout_s": init_timeout_s,
+            "enabled": enabled,
+            "tools": tools,
+            "last_test_s": last_test_s,
+            "last_error": last_error,
+        }
+    return registry
+
+
+def _persist_remote_mcp_registry(path: Path, registry: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    payload = {"servers": list(registry.values())}
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -397,7 +643,9 @@ HTML_PAGE = """<!DOCTYPE html>
     .mcp-log-list { background: rgba(15, 31, 51, 0.6); border: 1px solid #233654; border-radius: 12px; padding: 10px 12px; max-height: 170px; overflow-y: auto; }
     .mcp-log-item { width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(61, 126, 255, 0.25); background: rgba(61, 126, 255, 0.06); color: #c7d5eb; text-align: left; cursor: pointer; margin: 6px 0; font-size: 0.85rem; }
     .mcp-log-item:hover { background: rgba(61, 126, 255, 0.14); }
+    .mcp-log-item.selected { border-color: rgba(61, 126, 255, 0.7); background: rgba(61, 126, 255, 0.18); }
     .mcp-log-content { background: #0f1f33; border: 1px solid #233654; border-radius: 12px; padding: 12px; max-height: 280px; overflow: auto; white-space: pre-wrap; font-family: "Fira Code", Consolas, monospace; font-size: 0.8rem; color: #f4f6fb; }
+    .mcp-log-path.error { color: #ff7586; }
     @media (max-width: 640px) {
       .container { padding: 24px 16px; }
       .header { flex-direction: column; align-items: stretch; }
@@ -565,6 +813,31 @@ HTML_PAGE = """<!DOCTYPE html>
           <div id="mcp-orbit-logs" class="mcp-log-list"></div>
           <pre id="mcp-orbit-log-content" class="mcp-log-content"></pre>
         </div>
+
+        <div class="settings-card" data-provider="mcp-remote">
+          <div class="settings-card-header">
+            <span class="settings-card-title">MCP (Remote Servers)</span>
+            <div class="button-row">
+              <button type="button" class="button secondary" id="refresh-mcp-remote">Refresh</button>
+              <button type="button" class="button" id="add-mcp-remote">Add Server</button>
+            </div>
+          </div>
+          <div>
+            <label class="settings-label" for="mcp-remote-name">Name</label>
+            <div class="input-row">
+              <input id="mcp-remote-name" type="text" placeholder="My MCP Server" autocomplete="off" />
+            </div>
+          </div>
+          <div>
+            <label class="settings-label" for="mcp-remote-url">Server URL (HTTP)</label>
+            <div class="input-row">
+              <input id="mcp-remote-url" type="text" placeholder="http://localhost:8001" autocomplete="off" />
+            </div>
+          </div>
+          <div id="mcp-remote-status" class="mcp-log-path"></div>
+          <div id="mcp-remote-servers" class="mcp-log-list"></div>
+          <div id="mcp-remote-tools" class="mcp-tools"></div>
+        </div>
       </div>
     </section>
     <div id="chat-log" class="chat-log"></div>
@@ -617,6 +890,17 @@ HTML_PAGE = """<!DOCTYPE html>
         refreshLogsButton: null,
         loading: false,
       };
+      const remoteMcpState = {
+        nameInput: null,
+        urlInput: null,
+        addButton: null,
+        refreshButton: null,
+        statusBox: null,
+        serversBox: null,
+        toolsBox: null,
+        selectedId: null,
+        loading: false,
+      };
 
       const orbitMcpStorage = {
         server: "nos3-rag-mcp-orbit-server",
@@ -624,6 +908,9 @@ HTML_PAGE = """<!DOCTYPE html>
         protocol: "nos3-rag-mcp-orbit-protocol",
         framing: "nos3-rag-mcp-orbit-framing",
         timeout: "nos3-rag-mcp-orbit-timeout",
+      };
+      const remoteMcpStorage = {
+        servers: "nos3-rag-mcp-remote-servers",
       };
 
       const storageKeys = (providerId) => ({
@@ -719,11 +1006,11 @@ HTML_PAGE = """<!DOCTYPE html>
         node.appendChild(badge);
       };
 
-      const refreshProviderDisabled = () => {
-        PROVIDERS.forEach(({ id }) => {
-          const state = providerState[id];
-          if (!state) return;
-          const disabled = chatLoading || state.loading;
+	      const refreshProviderDisabled = () => {
+	        PROVIDERS.forEach(({ id }) => {
+	          const state = providerState[id];
+	          if (!state) return;
+	          const disabled = chatLoading || state.loading;
           state.keyInput.disabled = disabled;
           state.remember.disabled = disabled;
           state.modelSelect.disabled = disabled || !state.models.length;
@@ -744,7 +1031,19 @@ HTML_PAGE = """<!DOCTYPE html>
         if (orbitMcpState.testButton) orbitMcpState.testButton.disabled = orbitDisabled;
         if (orbitMcpState.stopButton) orbitMcpState.stopButton.disabled = orbitDisabled;
         if (orbitMcpState.refreshLogsButton) orbitMcpState.refreshLogsButton.disabled = orbitDisabled;
-      };
+
+	        const remoteDisabled = chatLoading || remoteMcpState.loading;
+	        if (remoteMcpState.nameInput) remoteMcpState.nameInput.disabled = remoteDisabled;
+	        if (remoteMcpState.urlInput) remoteMcpState.urlInput.disabled = remoteDisabled;
+	        if (remoteMcpState.addButton) remoteMcpState.addButton.disabled = remoteDisabled;
+	        if (remoteMcpState.refreshButton) remoteMcpState.refreshButton.disabled = remoteDisabled;
+	        document.querySelectorAll(".mcp-remote-server").forEach((button) => {
+	          button.disabled = remoteDisabled;
+	        });
+	        document.querySelectorAll(".mcp-remote-action").forEach((button) => {
+	          button.disabled = remoteDisabled;
+	        });
+	      };
 
       const setLoading = (loading) => {
         chatLoading = loading;
@@ -1257,10 +1556,10 @@ HTML_PAGE = """<!DOCTYPE html>
         }
       };
 
-      const initOrbitMcp = () => {
-        orbitMcpState.serverInput = document.getElementById("mcp-orbit-server");
-        orbitMcpState.pythonInput = document.getElementById("mcp-orbit-python");
-        orbitMcpState.protocolInput = document.getElementById("mcp-orbit-protocol");
+	      const initOrbitMcp = () => {
+	        orbitMcpState.serverInput = document.getElementById("mcp-orbit-server");
+	        orbitMcpState.pythonInput = document.getElementById("mcp-orbit-python");
+	        orbitMcpState.protocolInput = document.getElementById("mcp-orbit-protocol");
         orbitMcpState.framingSelect = document.getElementById("mcp-orbit-framing");
         orbitMcpState.timeoutInput = document.getElementById("mcp-orbit-timeout");
         orbitMcpState.saveButton = document.getElementById("save-mcp-orbit");
@@ -1314,14 +1613,370 @@ HTML_PAGE = """<!DOCTYPE html>
         orbitMcpState.testButton.addEventListener("click", () => testOrbitMcp());
         if (orbitMcpState.refreshLogsButton) orbitMcpState.refreshLogsButton.addEventListener("click", () => fetchOrbitLogs());
         if (orbitMcpState.stopButton) orbitMcpState.stopButton.addEventListener("click", () => stopOrbitSim());
-        fetchOrbitLogs();
-        fetchOrbitSimStatus();
-      };
+	        fetchOrbitLogs();
+	        fetchOrbitSimStatus();
+	      };
 
-      const loadInitialEmbeddings = async () => {
-        try {
-          const response = await fetch("/api/embeddings");
-          if (!response.ok) return;
+	      const setRemoteMcpStatus = (message, isError = false) => {
+	        if (!remoteMcpState.statusBox) return;
+	        remoteMcpState.statusBox.textContent = message || "";
+	        remoteMcpState.statusBox.classList.toggle("error", Boolean(isError && message));
+	      };
+
+	      const formatRemoteTestStamp = (seconds) => {
+	        const value = Number(seconds);
+	        if (!Number.isFinite(value) || value <= 0) return "never";
+	        return new Date(value * 1000).toLocaleString();
+	      };
+
+	      const renderRemoteMcpTools = (server, extra) => {
+	        if (!remoteMcpState.toolsBox) return;
+	        remoteMcpState.toolsBox.innerHTML = "";
+	        if (!server) {
+	          remoteMcpState.toolsBox.textContent = "Select a server to view tools.";
+	          return;
+	        }
+
+	        const header = document.createElement("div");
+	        const name = server.name ? String(server.name) : "Remote MCP server";
+	        header.textContent = `${name} · ${server.url || ""}`.trim();
+	        remoteMcpState.toolsBox.appendChild(header);
+
+	        const meta = document.createElement("div");
+	        const enabled = server.enabled !== false;
+	        const toolCount = Array.isArray(server.tools) ? server.tools.length : 0;
+	        const lastTest = formatRemoteTestStamp(server.last_test_s);
+	        meta.textContent = `Status: ${enabled ? "enabled" : "disabled"} · Tools cached: ${toolCount} · Last test: ${lastTest}`;
+	        remoteMcpState.toolsBox.appendChild(meta);
+
+	        if (server.last_error) {
+	          const errorBox = document.createElement("div");
+	          errorBox.className = "mcp-log-path error";
+	          errorBox.textContent = `Last error: ${String(server.last_error)}`;
+	          remoteMcpState.toolsBox.appendChild(errorBox);
+	        }
+
+	        const actionRow = document.createElement("div");
+	        actionRow.className = "button-row";
+
+	        const testButton = document.createElement("button");
+	        testButton.type = "button";
+	        testButton.className = "button secondary mcp-remote-action";
+	        testButton.textContent = "Test & List Tools";
+	        testButton.addEventListener("click", () => testRemoteMcpServer(server.id));
+	        actionRow.appendChild(testButton);
+
+	        const toggleButton = document.createElement("button");
+	        toggleButton.type = "button";
+	        toggleButton.className = "button secondary mcp-remote-action";
+	        toggleButton.textContent = enabled ? "Disable" : "Enable";
+	        toggleButton.addEventListener("click", () => toggleRemoteMcpServer(server));
+	        actionRow.appendChild(toggleButton);
+
+	        const deleteButton = document.createElement("button");
+	        deleteButton.type = "button";
+	        deleteButton.className = "button secondary mcp-remote-action";
+	        deleteButton.textContent = "Delete";
+	        deleteButton.addEventListener("click", () => deleteRemoteMcpServer(server.id));
+	        actionRow.appendChild(deleteButton);
+
+	        remoteMcpState.toolsBox.appendChild(actionRow);
+
+	        const serverInfo = extra && extra.server_info ? extra.server_info : null;
+	        const protocol = extra && extra.protocol_version ? extra.protocol_version : null;
+	        if (serverInfo && (serverInfo.name || serverInfo.version || protocol)) {
+	          const infoLine = document.createElement("div");
+	          const infoName = serverInfo.name ? String(serverInfo.name) : "MCP server";
+	          const infoVersion = serverInfo.version ? String(serverInfo.version) : "";
+	          const proto = protocol ? ` · protocol ${protocol}` : "";
+	          infoLine.textContent = infoVersion ? `${infoName} ${infoVersion}${proto}` : `${infoName}${proto}`;
+	          remoteMcpState.toolsBox.appendChild(infoLine);
+	        }
+
+	        const tools = Array.isArray(server.tools) ? server.tools : [];
+	        if (!tools.length) {
+	          const empty = document.createElement("div");
+	          empty.textContent = "No tools cached yet. Click Test & List Tools.";
+	          remoteMcpState.toolsBox.appendChild(empty);
+	          return;
+	        }
+
+	        const list = document.createElement("ul");
+	        tools.forEach((tool) => {
+	          if (!tool || !tool.name) return;
+	          const item = document.createElement("li");
+	          const toolName = String(tool.name);
+	          const desc = tool.description ? String(tool.description) : "";
+	          item.textContent = desc ? `${toolName} — ${desc}` : toolName;
+	          list.appendChild(item);
+	        });
+	        remoteMcpState.toolsBox.appendChild(list);
+
+	        const hint = document.createElement("div");
+	        hint.className = "mcp-log-path";
+	        hint.textContent = "Tip: enabled remote MCP tools are available for agentic use in chat.";
+	        remoteMcpState.toolsBox.appendChild(hint);
+	      };
+
+	      const renderRemoteMcpServers = (servers) => {
+	        if (!remoteMcpState.serversBox) return;
+	        remoteMcpState.serversBox.innerHTML = "";
+
+	        const list = Array.isArray(servers) ? servers : [];
+	        if (!list.length) {
+	          const empty = document.createElement("div");
+	          empty.textContent = "No remote MCP servers configured yet.";
+	          remoteMcpState.serversBox.appendChild(empty);
+	          renderRemoteMcpTools(null);
+	          return;
+	        }
+
+	        list.forEach((server) => {
+	          if (!server || !server.id) return;
+	          const button = document.createElement("button");
+	          button.type = "button";
+	          button.className = "mcp-log-item mcp-remote-server";
+	          if (server.id === remoteMcpState.selectedId) button.classList.add("selected");
+	          const enabled = server.enabled !== false;
+	          const toolCount = Array.isArray(server.tools) ? server.tools.length : 0;
+	          const stamp = formatRemoteTestStamp(server.last_test_s);
+	          const parts = [`${toolCount} tool${toolCount === 1 ? "" : "s"}`, `last test: ${stamp}`];
+	          if (!enabled) parts.push("disabled");
+	          if (server.last_error) parts.push("error");
+	          button.textContent = `${server.name || server.id} — ${server.url || ""} (${parts.join("; ")})`.trim();
+	          button.addEventListener("click", () => selectRemoteMcpServer(server.id));
+	          remoteMcpState.serversBox.appendChild(button);
+	        });
+	      };
+
+	      const selectRemoteMcpServer = (serverId, extra) => {
+	        const id = String(serverId || "").trim();
+	        remoteMcpState.selectedId = id || null;
+	        renderRemoteMcpServers(remoteMcpState.servers);
+	        const server = (remoteMcpState.servers || []).find((entry) => entry && entry.id === id);
+	        renderRemoteMcpTools(server || null, extra || null);
+	      };
+
+	      const fetchRemoteMcpServers = async () => {
+	        remoteMcpState.loading = true;
+	        refreshProviderDisabled();
+	        setRemoteMcpStatus("Loading remote MCP servers...");
+	        try {
+	          const response = await fetch("/api/mcp/remote");
+	          if (!response.ok) {
+	            setRemoteMcpStatus("Failed to load remote MCP servers.", true);
+	            return;
+	          }
+	          const data = await response.json();
+	          const servers = data && Array.isArray(data.servers) ? data.servers : [];
+	          remoteMcpState.servers = servers;
+	          renderRemoteMcpServers(servers);
+	          if (remoteMcpState.selectedId && servers.some((s) => s && s.id === remoteMcpState.selectedId)) {
+	            selectRemoteMcpServer(remoteMcpState.selectedId);
+	          } else if (servers.length) {
+	            selectRemoteMcpServer(servers[0].id);
+	          }
+	          setRemoteMcpStatus(`Loaded ${servers.length} remote MCP server${servers.length === 1 ? "" : "s"}.`);
+	        } catch (error) {
+	          console.error(error);
+	          setRemoteMcpStatus("Error loading remote MCP servers. See console for details.", true);
+	        } finally {
+	          remoteMcpState.loading = false;
+	          refreshProviderDisabled();
+	        }
+	      };
+
+	      const addRemoteMcpServer = async () => {
+	        if (!remoteMcpState.nameInput || !remoteMcpState.urlInput) return;
+	        const name = (remoteMcpState.nameInput.value || "").trim();
+	        const url = (remoteMcpState.urlInput.value || "").trim();
+	        if (!name || !url) {
+	          updateSettingsStatus("Provide both a name and server URL.", true);
+	          setRemoteMcpStatus("Provide both a name and server URL.", true);
+	          return;
+	        }
+	        remoteMcpState.loading = true;
+	        refreshProviderDisabled();
+	        updateSettingsStatus("Adding remote MCP server...");
+	        setRemoteMcpStatus("Adding server...");
+	        try {
+	          const response = await fetch("/api/mcp/remote", {
+	            method: "POST",
+	            headers: { "Content-Type": "application/json" },
+	            body: JSON.stringify({ name, url }),
+	          });
+	          if (!response.ok) {
+	            let detail = "Failed to add remote MCP server.";
+	            try {
+	              const err = await response.json();
+	              detail = err.detail || detail;
+	            } catch (_) {}
+	            updateSettingsStatus(detail, true);
+	            setRemoteMcpStatus(detail, true);
+	            return;
+	          }
+	          const server = await response.json();
+	          remoteMcpState.nameInput.value = "";
+	          remoteMcpState.urlInput.value = "";
+	          await fetchRemoteMcpServers();
+	          if (server && server.id) selectRemoteMcpServer(server.id);
+	          updateSettingsStatus("Remote MCP server added.");
+	        } catch (error) {
+	          console.error(error);
+	          updateSettingsStatus("Error adding remote MCP server. See console for details.", true);
+	          setRemoteMcpStatus("Error adding remote MCP server. See console for details.", true);
+	        } finally {
+	          remoteMcpState.loading = false;
+	          refreshProviderDisabled();
+	        }
+	      };
+
+	      const deleteRemoteMcpServer = async (serverId) => {
+	        const id = String(serverId || "").trim();
+	        if (!id) return;
+	        if (!confirm("Delete this remote MCP server?")) return;
+	        remoteMcpState.loading = true;
+	        refreshProviderDisabled();
+	        updateSettingsStatus("Deleting remote MCP server...");
+	        setRemoteMcpStatus("Deleting server...");
+	        try {
+	          const response = await fetch(`/api/mcp/remote/${encodeURIComponent(id)}`, { method: "DELETE" });
+	          if (!response.ok) {
+	            let detail = "Failed to delete remote MCP server.";
+	            try {
+	              const err = await response.json();
+	              detail = err.detail || detail;
+	            } catch (_) {}
+	            updateSettingsStatus(detail, true);
+	            setRemoteMcpStatus(detail, true);
+	            return;
+	          }
+	          const data = await response.json();
+	          const servers = data && Array.isArray(data.servers) ? data.servers : [];
+	          remoteMcpState.servers = servers;
+	          if (remoteMcpState.selectedId === id) {
+	            remoteMcpState.selectedId = servers.length ? servers[0].id : null;
+	          }
+	          renderRemoteMcpServers(servers);
+	          if (remoteMcpState.selectedId) selectRemoteMcpServer(remoteMcpState.selectedId);
+	          updateSettingsStatus("Remote MCP server deleted.");
+	          setRemoteMcpStatus("Remote MCP server deleted.");
+	        } catch (error) {
+	          console.error(error);
+	          updateSettingsStatus("Error deleting remote MCP server. See console for details.", true);
+	          setRemoteMcpStatus("Error deleting remote MCP server. See console for details.", true);
+	        } finally {
+	          remoteMcpState.loading = false;
+	          refreshProviderDisabled();
+	        }
+	      };
+
+	      const toggleRemoteMcpServer = async (server) => {
+	        if (!server || !server.id) return;
+	        remoteMcpState.loading = true;
+	        refreshProviderDisabled();
+	        updateSettingsStatus("Updating remote MCP server...");
+	        setRemoteMcpStatus("Updating server...");
+	        try {
+	          const response = await fetch("/api/mcp/remote", {
+	            method: "POST",
+	            headers: { "Content-Type": "application/json" },
+	            body: JSON.stringify({
+	              id: server.id,
+	              name: server.name,
+	              url: server.url,
+	              protocol_version: server.protocol_version || "2024-11-05",
+	              init_timeout_s: server.init_timeout_s != null ? server.init_timeout_s : 30,
+	              enabled: !(server.enabled !== false),
+	            }),
+	          });
+	          if (!response.ok) {
+	            let detail = "Failed to update remote MCP server.";
+	            try {
+	              const err = await response.json();
+	              detail = err.detail || detail;
+	            } catch (_) {}
+	            updateSettingsStatus(detail, true);
+	            setRemoteMcpStatus(detail, true);
+	            return;
+	          }
+	          await fetchRemoteMcpServers();
+	          selectRemoteMcpServer(server.id);
+	          updateSettingsStatus("Remote MCP server updated.");
+	        } catch (error) {
+	          console.error(error);
+	          updateSettingsStatus("Error updating remote MCP server. See console for details.", true);
+	          setRemoteMcpStatus("Error updating remote MCP server. See console for details.", true);
+	        } finally {
+	          remoteMcpState.loading = false;
+	          refreshProviderDisabled();
+	        }
+	      };
+
+	      const testRemoteMcpServer = async (serverId) => {
+	        const id = String(serverId || "").trim();
+	        if (!id) return;
+	        remoteMcpState.loading = true;
+	        refreshProviderDisabled();
+	        updateSettingsStatus("Testing remote MCP server...");
+	        setRemoteMcpStatus("Testing connectivity...");
+	        try {
+	          const response = await fetch(`/api/mcp/remote/${encodeURIComponent(id)}/test`, { method: "POST" });
+	          if (!response.ok) {
+	            let detail = "Remote MCP test failed.";
+	            try {
+	              const err = await response.json();
+	              detail = err.detail || detail;
+	            } catch (_) {}
+	            updateSettingsStatus(detail, true);
+	            setRemoteMcpStatus(detail, true);
+	            return;
+	          }
+	          const data = await response.json();
+	          const server = data && data.server ? data.server : null;
+	          if (server && server.id) {
+	            await fetchRemoteMcpServers();
+	            selectRemoteMcpServer(server.id, data);
+	          } else {
+	            await fetchRemoteMcpServers();
+	          }
+	          const toolCount = data && Array.isArray(data.tools) ? data.tools.length : 0;
+	          updateSettingsStatus(`Remote MCP connected. Tools: ${toolCount}`);
+	          setRemoteMcpStatus(`Remote MCP connected. Tools: ${toolCount}`);
+	        } catch (error) {
+	          console.error(error);
+	          updateSettingsStatus("Error testing remote MCP server. See console for details.", true);
+	          setRemoteMcpStatus("Error testing remote MCP server. See console for details.", true);
+	        } finally {
+	          remoteMcpState.loading = false;
+	          refreshProviderDisabled();
+	        }
+	      };
+
+	      const initRemoteMcp = () => {
+	        remoteMcpState.nameInput = document.getElementById("mcp-remote-name");
+	        remoteMcpState.urlInput = document.getElementById("mcp-remote-url");
+	        remoteMcpState.addButton = document.getElementById("add-mcp-remote");
+	        remoteMcpState.refreshButton = document.getElementById("refresh-mcp-remote");
+	        remoteMcpState.statusBox = document.getElementById("mcp-remote-status");
+	        remoteMcpState.serversBox = document.getElementById("mcp-remote-servers");
+	        remoteMcpState.toolsBox = document.getElementById("mcp-remote-tools");
+	        remoteMcpState.servers = [];
+
+	        if (!remoteMcpState.nameInput || !remoteMcpState.urlInput || !remoteMcpState.addButton || !remoteMcpState.refreshButton || !remoteMcpState.statusBox || !remoteMcpState.serversBox || !remoteMcpState.toolsBox) {
+	          console.warn("Remote MCP configuration elements missing from the page.");
+	          return;
+	        }
+
+	        remoteMcpState.refreshButton.addEventListener("click", () => fetchRemoteMcpServers());
+	        remoteMcpState.addButton.addEventListener("click", () => addRemoteMcpServer());
+	        fetchRemoteMcpServers();
+	      };
+
+	      const loadInitialEmbeddings = async () => {
+	        try {
+	          const response = await fetch("/api/embeddings");
+	          if (!response.ok) return;
           const payload = await response.json();
           if (embeddingsState.urlInput && payload.ollama_url) {
             embeddingsState.urlInput.value = payload.ollama_url;
@@ -1361,12 +2016,13 @@ HTML_PAGE = """<!DOCTYPE html>
         }
       };
 
-      PROVIDERS.forEach(initProvider);
-      initEmbeddings();
-      initOrbitMcp();
-      loadInitialEmbeddings();
-      loadInitialOrbitMcp();
-      refreshProviderDisabled();
+	      PROVIDERS.forEach(initProvider);
+	      initEmbeddings();
+	      initOrbitMcp();
+	      initRemoteMcp();
+	      loadInitialEmbeddings();
+	      loadInitialOrbitMcp();
+	      refreshProviderDisabled();
 
       const toggleSettings = () => {
         settingsPanel.classList.toggle("hidden");
@@ -1582,6 +2238,38 @@ class OrbitMcpSimStatusResponse(BaseModel):
 class OrbitMcpStopResponse(BaseModel):
     stop_requested: bool = False
     status: OrbitMcpSimStatusResponse = Field(default_factory=OrbitMcpSimStatusResponse)
+
+
+class RemoteMcpServerCreateRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(..., min_length=1)
+    url: str = Field(..., min_length=1)
+    protocol_version: str = Field("2024-11-05", min_length=1)
+    init_timeout_s: float = Field(30.0, ge=0.1, le=300.0)
+    enabled: bool = True
+
+
+class RemoteMcpServerInfo(BaseModel):
+    id: str
+    name: str
+    url: str
+    protocol_version: str = Field("2024-11-05", min_length=1)
+    init_timeout_s: float = Field(30.0, ge=0.1, le=300.0)
+    enabled: bool = True
+    tools: List[Dict[str, Any]] = Field(default_factory=list)
+    last_test_s: float | None = None
+    last_error: str | None = None
+
+
+class RemoteMcpServersResponse(BaseModel):
+    servers: List[RemoteMcpServerInfo] = Field(default_factory=list)
+
+
+class RemoteMcpTestResponse(BaseModel):
+    server: RemoteMcpServerInfo
+    server_info: Dict[str, Any] = Field(default_factory=dict)
+    protocol_version: str | None = None
+    tools: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ModelSelectionError(Exception):
@@ -1855,6 +2543,8 @@ def create_app(config: WebConfig) -> FastAPI:
         "sambanova": _merge_candidates(config.sambanova_models, DEFAULT_MODEL_CANDIDATES["sambanova"]),
     }
     app.state.selected_models: Dict[str, str] = {}
+    app.state.remote_mcp_registry_path: Path = _REMOTE_MCP_REGISTRY_PATH
+    app.state.remote_mcp_servers: Dict[str, Dict[str, Any]] = _load_remote_mcp_registry(app.state.remote_mcp_registry_path)
     app.router.lifespan_context = lifespan
 
     @app.get("/", response_class=HTMLResponse)
@@ -2190,6 +2880,142 @@ def create_app(config: WebConfig) -> FastAPI:
         requested = stop_active_orbit_simulation()
         return OrbitMcpStopResponse(stop_requested=requested, status=orbit_sim_status())
 
+    def _remote_mcp_snapshot() -> RemoteMcpServersResponse:
+        servers: List[RemoteMcpServerInfo] = []
+        with _REMOTE_MCP_REGISTRY_LOCK:
+            entries = list(app.state.remote_mcp_servers.values())
+        for entry in entries:
+            try:
+                servers.append(RemoteMcpServerInfo(**entry))
+            except Exception:
+                continue
+        servers.sort(key=lambda s: (not s.enabled, s.name.lower(), s.id))
+        return RemoteMcpServersResponse(servers=servers)
+
+    def _new_remote_mcp_id() -> str:
+        for _ in range(10):
+            candidate = secrets.token_hex(8)
+            if candidate not in app.state.remote_mcp_servers:
+                return candidate
+        return secrets.token_hex(16)
+
+    @app.get("/api/mcp/remote", response_model=RemoteMcpServersResponse)
+    def get_remote_mcp_servers() -> RemoteMcpServersResponse:
+        return _remote_mcp_snapshot()
+
+    @app.post("/api/mcp/remote", response_model=RemoteMcpServerInfo)
+    def upsert_remote_mcp_server(request: RemoteMcpServerCreateRequest) -> RemoteMcpServerInfo:
+        name = request.name.strip()
+        url = request.url.strip()
+        protocol_version = request.protocol_version.strip()
+        init_timeout_s = float(request.init_timeout_s)
+        enabled = bool(request.enabled)
+
+        if not name:
+            raise HTTPException(status_code=400, detail="name cannot be empty.")
+        if not url:
+            raise HTTPException(status_code=400, detail="url cannot be empty.")
+        if not protocol_version:
+            raise HTTPException(status_code=400, detail="protocol_version cannot be empty.")
+        try:
+            _ = RemoteMCPServerConfig(
+                name=name,
+                url=url,
+                protocol_version=protocol_version,
+                init_timeout_s=init_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"Invalid MCP server settings: {exc}") from exc
+
+        with _REMOTE_MCP_REGISTRY_LOCK:
+            server_id = (request.id or "").strip()
+            if server_id:
+                existing = app.state.remote_mcp_servers.get(server_id)
+                if existing is None:
+                    raise HTTPException(status_code=404, detail=f"Unknown MCP server id: {server_id}")
+                existing.update(
+                    {
+                        "name": name,
+                        "url": url,
+                        "protocol_version": protocol_version,
+                        "init_timeout_s": init_timeout_s,
+                        "enabled": enabled,
+                    }
+                )
+                existing.setdefault("tools", [])
+                existing.setdefault("last_test_s", None)
+                existing.setdefault("last_error", None)
+                _persist_remote_mcp_registry(app.state.remote_mcp_registry_path, app.state.remote_mcp_servers)
+                return RemoteMcpServerInfo(**existing)
+
+            server_id = _new_remote_mcp_id()
+            entry: Dict[str, Any] = {
+                "id": server_id,
+                "name": name,
+                "url": url,
+                "protocol_version": protocol_version,
+                "init_timeout_s": init_timeout_s,
+                "enabled": enabled,
+                "tools": [],
+                "last_test_s": None,
+                "last_error": None,
+            }
+            app.state.remote_mcp_servers[server_id] = entry
+            _persist_remote_mcp_registry(app.state.remote_mcp_registry_path, app.state.remote_mcp_servers)
+            return RemoteMcpServerInfo(**entry)
+
+    @app.delete("/api/mcp/remote/{server_id}", response_model=RemoteMcpServersResponse)
+    def delete_remote_mcp_server(server_id: str) -> RemoteMcpServersResponse:
+        server_id = (server_id or "").strip()
+        if not server_id:
+            raise HTTPException(status_code=400, detail="server_id cannot be empty.")
+        with _REMOTE_MCP_REGISTRY_LOCK:
+            app.state.remote_mcp_servers.pop(server_id, None)
+            _persist_remote_mcp_registry(app.state.remote_mcp_registry_path, app.state.remote_mcp_servers)
+        return _remote_mcp_snapshot()
+
+    @app.post("/api/mcp/remote/{server_id}/test", response_model=RemoteMcpTestResponse)
+    async def test_remote_mcp_server(server_id: str) -> RemoteMcpTestResponse:
+        server_id = (server_id or "").strip()
+        with _REMOTE_MCP_REGISTRY_LOCK:
+            entry = app.state.remote_mcp_servers.get(server_id)
+            if entry is None:
+                raise HTTPException(status_code=404, detail=f"Unknown MCP server id: {server_id}")
+            config = RemoteMCPServerConfig(
+                name=entry.get("name") or server_id,
+                url=entry.get("url") or "",
+                protocol_version=entry.get("protocol_version") or "2024-11-05",
+                init_timeout_s=float(entry.get("init_timeout_s") or 30.0),
+            )
+
+        try:
+            result = await run_in_threadpool(test_remote_mcp_connection, config=config)
+        except RemoteMCPError as exc:
+            with _REMOTE_MCP_REGISTRY_LOCK:
+                entry = app.state.remote_mcp_servers.get(server_id)
+                if entry is not None:
+                    entry["last_test_s"] = time.time()
+                    entry["last_error"] = str(exc)
+                    _persist_remote_mcp_registry(app.state.remote_mcp_registry_path, app.state.remote_mcp_servers)
+            raise HTTPException(status_code=502, detail=f"Remote MCP test failed: {exc}") from exc
+
+        tools = result.get("tools") if isinstance(result, dict) else None
+        with _REMOTE_MCP_REGISTRY_LOCK:
+            entry = app.state.remote_mcp_servers.get(server_id)
+            if entry is None:
+                raise HTTPException(status_code=404, detail=f"Unknown MCP server id: {server_id}")
+            entry["tools"] = tools if isinstance(tools, list) else []
+            entry["last_test_s"] = time.time()
+            entry["last_error"] = None
+            _persist_remote_mcp_registry(app.state.remote_mcp_registry_path, app.state.remote_mcp_servers)
+            server = RemoteMcpServerInfo(**entry)
+        return RemoteMcpTestResponse(
+            server=server,
+            server_info=result.get("server_info") if isinstance(result, dict) and isinstance(result.get("server_info"), dict) else {},
+            protocol_version=result.get("protocol_version") if isinstance(result, dict) else None,
+            tools=server.tools,
+        )
+
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(payload: ChatRequest) -> ChatResponse:
         message = payload.message.strip()
@@ -2364,6 +3190,134 @@ def create_app(config: WebConfig) -> FastAPI:
                     provider="MCP",
                     model="visualize_orbit",
                     provider_id="satellite-sim",
+                )
+
+        remote_servers: list[dict[str, Any]] = []
+        with _REMOTE_MCP_REGISTRY_LOCK:
+            for entry in app.state.remote_mcp_servers.values():
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("enabled") is False:
+                    continue
+                tools = entry.get("tools")
+                if not isinstance(tools, list) or not tools:
+                    continue
+                remote_servers.append(dict(entry))
+
+        if remote_servers and _should_attempt_remote_mcp_routing(message, history, remote_servers):
+            request_model_overrides = {
+                (name or "").strip().lower(): value.strip()
+                for name, value in (payload.provider_models or {}).items()
+                if name and isinstance(name, str) and isinstance(value, str) and value.strip()
+            }
+
+            key_map = {
+                "cerebras": (payload.cerebras_api_key or "").strip() or (app.state.config.cerebras_api_key or "").strip(),
+                "groq": (payload.groq_api_key or "").strip() or (app.state.config.groq_api_key or "").strip(),
+                "sambanova": (payload.sambanova_api_key or "").strip() or (app.state.config.sambanova_api_key or "").strip(),
+            }
+
+            router_provider: str | None = None
+            router_model: str | None = None
+            decision: dict[str, Any] | None = None
+
+            for provider_name in ("cerebras", "groq", "sambanova"):
+                key_value = key_map.get(provider_name) or ""
+                if not key_value:
+                    continue
+                model_value = request_model_overrides.get(provider_name) or _select_router_model(
+                    app.state.config, app.state.selected_models, provider_name
+                )
+                if not model_value:
+                    continue
+                try:
+                    llm = _create_router_llm(provider_name, model_value, key_value)
+                except Exception:
+                    continue
+                decision = await run_in_threadpool(_route_remote_mcp_request_with_llm, llm, message, remote_servers)
+                router_provider = provider_name
+                router_model = model_value
+                if decision is not None:
+                    break
+
+            action = (decision.get("action") if isinstance(decision, dict) else None) or ""
+            action = str(action).strip().lower()
+
+            if action == "mcp":
+                server_id = str((decision or {}).get("server_id") or "").strip()
+                tool_name = str((decision or {}).get("tool_name") or (decision or {}).get("tool") or "").strip()
+                args_raw = (decision or {}).get("arguments")
+                arguments = args_raw if isinstance(args_raw, dict) else {}
+
+                server_entry: dict[str, Any] | None = None
+                with _REMOTE_MCP_REGISTRY_LOCK:
+                    entry = app.state.remote_mcp_servers.get(server_id)
+                    if isinstance(entry, dict) and entry.get("enabled") is not False:
+                        server_entry = dict(entry)
+
+                if server_entry and tool_name:
+                    tool_ok = False
+                    tools = server_entry.get("tools")
+                    if isinstance(tools, list):
+                        for tool in tools:
+                            if isinstance(tool, dict) and str(tool.get("name") or "") == tool_name:
+                                tool_ok = True
+                                break
+
+                    if tool_ok:
+                        config = RemoteMCPServerConfig(
+                            name=server_entry.get("name") or server_id,
+                            url=server_entry.get("url") or "",
+                            protocol_version=server_entry.get("protocol_version") or "2024-11-05",
+                            init_timeout_s=float(server_entry.get("init_timeout_s") or 30.0),
+                        )
+                        try:
+                            result_text = await run_in_threadpool(
+                                remote_call_tool_text,
+                                config=config,
+                                name=tool_name,
+                                arguments=arguments,
+                            )
+                        except RemoteMCPError as exc:
+                            answer = f"Remote MCP tool call failed: {exc}"
+                            updated_history = history + [ChatTurn(question=message, answer=answer)]
+                            return ChatResponse(
+                                answer=answer,
+                                sources=[],
+                                history=updated_history,
+                                provider="MCP",
+                                model=tool_name or "tools/call",
+                                provider_id=f"remote-mcp:{server_id}",
+                            )
+
+                        server_label = str(server_entry.get("name") or server_id)
+                        cleaned = (result_text or "").strip()
+                        answer = cleaned if cleaned else f"Remote MCP tool `{tool_name}` completed on `{server_label}`."
+                        if cleaned and not cleaned.lower().startswith(server_label.lower()):
+                            answer = f"[{server_label}] {tool_name}\n{cleaned}"
+
+                        updated_history = history + [ChatTurn(question=message, answer=answer)]
+                        return ChatResponse(
+                            answer=answer,
+                            sources=[],
+                            history=updated_history,
+                            provider="MCP",
+                            model=tool_name,
+                            provider_id=f"remote-mcp:{server_id}",
+                        )
+
+            if action == "clarify":
+                question = (decision.get("question") if isinstance(decision, dict) else None) or "What inputs should I use for that tool?"
+                answer = str(question).strip()
+                updated_history = history + [ChatTurn(question=message, answer=answer)]
+                provider_label = PROVIDER_LABELS.get(router_provider or "", router_provider) if router_provider else None
+                return ChatResponse(
+                    answer=answer,
+                    sources=[],
+                    history=updated_history,
+                    provider=provider_label,
+                    model=router_model,
+                    provider_id="remote-mcp-router",
                 )
 
         if app.state.startup_error:

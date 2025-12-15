@@ -63,6 +63,18 @@ Notes:
 - Override the server script path with `SAT_ORBIT_MCP_SERVER` if needed.
 - Override the TLE source (path or URL) with `SAT_ORBIT_TLE_SOURCE` (defaults to `SAT_Orbit_Sim_MCP/stations.txt` when present).
 
+## Remote MCP Servers (HTTP/SSE)
+
+The web UI Settings panel also supports adding **remote** MCP servers over HTTP (SSE transport). After you **Test & List Tools**, the returned tools are cached and the chat router can agentically call enabled remote tools.
+
+For local testing, you can run the included toy server:
+
+```bash
+python -m mcp_http_test_server.server --port 8001
+```
+
+Then add `http://localhost:8001` under **Settings → MCP (Remote Servers)** and click **Test & List Tools**.
+
 ## Running via Docker
 
 You can run the entire NOS3 RAG Chat app inside a Docker container—either in **CLI mode** or **web chat mode**.
