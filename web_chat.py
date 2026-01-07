@@ -784,8 +784,8 @@ class WebConfig:
     chunk_size: int = 1000
     chunk_overlap: int = 150
     rebuild: bool = False
-    ollama_url: str = DEFAULT_OLLAMA_URL
-    embedding_model: str = DEFAULT_EMBED_MODEL
+    ollama_url: str = "http://localhost:11434"
+    embedding_model: str = "embeddinggemma:latest"
     cerebras_model: str = DEFAULT_CEREBRAS_MODEL
     cerebras_api_key: str | None = None
     cerebras_models: List[str] = field(default_factory=lambda: DEFAULT_MODEL_CANDIDATES["cerebras"][:])
