@@ -58,6 +58,13 @@ from orbit_mcp import (
 
 from remote_mcp import RemoteMCPError, RemoteMCPServerConfig, call_tool_text as remote_call_tool_text
 from remote_mcp import test_connection as test_remote_mcp_connection
+from mcpo_openapi import (
+    MCPOError,
+    MCPOServerConfig,
+    call_tool_text as mcpo_call_tool_text,
+    resolve_openapi_urls,
+    test_connection as test_mcpo_connection,
+)
 
 
 _FLOAT_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)")
@@ -79,8 +86,20 @@ _ORBIT_INTENT_KEYWORDS = (
 _ORBIT_CONTEXT_KEYWORDS = ("orbit", "satellite", "iss", "target", "latitude", "longitude", "lat", "lon")
 _ORBIT_ACTION_KEYWORDS = ("run", "start", "launch", "simulate", "visualize", "show", "plot", "animate")
 
-_REMOTE_MCP_INTENT_KEYWORDS = ("mcp", "tool", "tools", "server", "servers", "endpoint", "sse")
+_REMOTE_MCP_INTENT_KEYWORDS = ("mcp", "tool", "tools", "server", "servers", "endpoint", "sse", "openapi", "mcpo")
 _REMOTE_MCP_ACTION_KEYWORDS = ("run", "call", "use", "execute", "invoke", "start", "trigger")
+
+_REMOTE_SERVER_TYPE_SSE = "mcp_sse"
+_REMOTE_SERVER_TYPE_MCPO = "mcpo"
+_REMOTE_SERVER_TYPES = {
+    _REMOTE_SERVER_TYPE_SSE: "MCP SSE",
+    _REMOTE_SERVER_TYPE_MCPO: "MCPO (OpenAPI)",
+}
+
+_REMOTE_TOOL_MAX_CALLS = 3
+_REMOTE_TOOL_HISTORY_MAX_ENTRIES = 6
+_REMOTE_TOOL_RESULT_MAX_CHARS = 500
+_ORBIT_COORD_TOOL_MAX_CALLS = 1
 
 
 def _extract_lat_lon_from_text(text: str) -> tuple[float, float] | None:
@@ -98,6 +117,236 @@ def _extract_lat_lon_from_text(text: str) -> tuple[float, float] | None:
         if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
             return lat, lon
     return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except Exception:
+            return None
+    return None
+
+
+def _extract_lat_lon_from_payload(payload: Any, *, depth: int = 0) -> tuple[float, float] | None:
+    if depth > 3:
+        return None
+    if isinstance(payload, dict):
+        lowered = {str(k).strip().lower(): v for k, v in payload.items() if isinstance(k, str)}
+        for lat_key, lon_key in (("latitude", "longitude"), ("lat", "lon"), ("lat", "lng")):
+            if lat_key in lowered and lon_key in lowered:
+                lat = _coerce_float(lowered[lat_key])
+                lon = _coerce_float(lowered[lon_key])
+                if lat is not None and lon is not None and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                    return lat, lon
+        for value in payload.values():
+            coords = _extract_lat_lon_from_payload(value, depth=depth + 1)
+            if coords is not None:
+                return coords
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            coords = _extract_lat_lon_from_payload(item, depth=depth + 1)
+            if coords is not None:
+                return coords
+        return None
+    if isinstance(payload, str):
+        return _extract_lat_lon_from_text(payload)
+    return None
+
+
+def _extract_lat_lon_from_tool_result(result_text: str) -> tuple[float, float] | None:
+    cleaned = (result_text or "").strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("{") or cleaned.startswith("["):
+        try:
+            payload = json.loads(cleaned)
+        except Exception:
+            payload = None
+        if payload is not None:
+            coords = _extract_lat_lon_from_payload(payload)
+            if coords is not None:
+                return coords
+    return _extract_lat_lon_from_text(cleaned)
+
+
+def _call_remote_tool(
+    server_entry: dict[str, Any],
+    tool_entry: dict[str, Any],
+    arguments: dict[str, Any],
+) -> tuple[str, str]:
+    server_id = str(server_entry.get("id") or "").strip()
+    server_type = str(server_entry.get("server_type") or _REMOTE_SERVER_TYPE_SSE).strip().lower()
+    if server_type not in _REMOTE_SERVER_TYPES:
+        server_type = _REMOTE_SERVER_TYPE_SSE
+    provider_id = f"remote-mcp:{server_id or 'unknown'}"
+    if server_type == _REMOTE_SERVER_TYPE_MCPO:
+        path = str(tool_entry.get("path") or "").strip()
+        method = str(tool_entry.get("method") or "POST").strip()
+        if not path:
+            raise MCPOError("MCPO tool metadata missing path.")
+        config = MCPOServerConfig(
+            name=server_entry.get("name") or server_id or "mcpo",
+            base_url=server_entry.get("url") or "",
+            openapi_url=server_entry.get("openapi_url"),
+        )
+        result_text = mcpo_call_tool_text(
+            config=config,
+            path=path,
+            method=method,
+            arguments=arguments,
+        )
+        provider_id = f"remote-mcpo:{server_id or 'unknown'}"
+    else:
+        config = RemoteMCPServerConfig(
+            name=server_entry.get("name") or server_id or "mcp",
+            url=server_entry.get("url") or "",
+            protocol_version=server_entry.get("protocol_version") or "2024-11-05",
+            init_timeout_s=float(server_entry.get("init_timeout_s") or 30.0),
+        )
+        result_text = remote_call_tool_text(
+            config=config,
+            name=str(tool_entry.get("name") or "").strip(),
+            arguments=arguments,
+        )
+    return result_text, provider_id
+
+
+def _tool_calls_from_history(tool_history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tool_calls: list[dict[str, Any]] = []
+    seen: set[tuple[str | None, str, str | None]] = set()
+    for entry in tool_history:
+        if not isinstance(entry, dict):
+            continue
+        tool_name = str(entry.get("tool") or "").strip()
+        if not tool_name:
+            continue
+        provider_id = entry.get("provider_id")
+        server = entry.get("server")
+        key = (provider_id if isinstance(provider_id, str) else None, tool_name, server if isinstance(server, str) else None)
+        if key in seen:
+            continue
+        seen.add(key)
+        tool_calls.append(
+            {
+                "provider": "MCP",
+                "model": tool_name,
+                "provider_id": provider_id,
+                "server": server,
+            }
+        )
+    return tool_calls
+
+
+async def _resolve_coords_with_remote_tools(
+    llm,
+    message: str,
+    remote_servers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    lookup_message = f"Find the latitude and longitude for the location in this request: {message}"
+    tool_history: list[dict[str, Any]] = []
+    used_servers: set[str] = set()
+    last_provider_id: str | None = None
+    last_tool_name: str | None = None
+    last_server_label: str | None = None
+    last_server_id: str | None = None
+
+    servers_by_id = {str(entry.get("id") or ""): entry for entry in remote_servers if isinstance(entry, dict)}
+
+    for _ in range(_ORBIT_COORD_TOOL_MAX_CALLS):
+        decision = await run_in_threadpool(
+            _route_remote_mcp_request_with_llm,
+            llm,
+            lookup_message,
+            remote_servers,
+            tool_history,
+            allow_tool_calls=True,
+            allow_final=False,
+        )
+        if not isinstance(decision, dict):
+            break
+
+        action = str(decision.get("action") or "").strip().lower()
+        if action == "clarify":
+            question = str(decision.get("question") or "").strip()
+            return {
+                "coords": None,
+                "clarify": question,
+                "tool_history": tool_history,
+            }
+        if action != "mcp":
+            break
+
+        server_id = str(decision.get("server_id") or "").strip()
+        tool_name = str(decision.get("tool_name") or decision.get("tool") or "").strip()
+        args_raw = decision.get("arguments")
+        arguments = args_raw if isinstance(args_raw, dict) else {}
+        if not server_id or not tool_name:
+            break
+
+        server_entry = servers_by_id.get(server_id)
+        if not isinstance(server_entry, dict):
+            break
+
+        tool_entry: dict[str, Any] | None = None
+        tools = server_entry.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                if isinstance(tool, dict) and str(tool.get("name") or "") == tool_name:
+                    tool_entry = tool
+                    break
+        if tool_entry is None:
+            break
+
+        try:
+            result_text, provider_id = await run_in_threadpool(
+                _call_remote_tool,
+                server_entry,
+                tool_entry,
+                arguments,
+            )
+        except (RemoteMCPError, MCPOError):
+            break
+
+        tool_calls_entry = {
+            "server": str(server_entry.get("name") or server_id),
+            "server_id": server_id,
+            "tool": tool_name,
+            "arguments": arguments,
+            "result": result_text,
+            "provider_id": provider_id,
+        }
+        tool_history.append(tool_calls_entry)
+        used_servers.add(server_id)
+        last_provider_id = provider_id
+        last_tool_name = tool_name
+        last_server_label = tool_calls_entry["server"]
+        last_server_id = server_id
+
+        coords = _extract_lat_lon_from_tool_result(result_text)
+        if coords is not None:
+            return {
+                "coords": coords,
+                "tool_history": tool_history,
+                "last_provider_id": last_provider_id,
+                "last_tool_name": last_tool_name,
+                "last_server_label": last_server_label,
+                "last_server_id": last_server_id,
+                "used_servers": used_servers,
+            }
+
+    return {
+        "coords": None,
+        "tool_history": tool_history,
+        "last_provider_id": last_provider_id,
+        "last_tool_name": last_tool_name,
+        "last_server_label": last_server_label,
+        "last_server_id": last_server_id,
+        "used_servers": used_servers,
+    }
 
 
 def _should_attempt_orbit_nl_routing(message: str, history: list["ChatTurn"]) -> bool:
@@ -155,7 +404,8 @@ def _should_attempt_remote_mcp_routing(
             tool_name = str(tool.get("name") or "").strip().lower()
             if tool_name and tool_name in text:
                 return True
-    return False
+    # Default to letting the router decide when remote tools exist.
+    return True
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
@@ -296,9 +546,16 @@ def _summarize_remote_mcp_tools_for_prompt(remote_servers: list[dict[str, Any]],
         server_id = str(server.get("id") or "").strip()
         server_name = str(server.get("name") or server_id or "server").strip()
         server_url = str(server.get("url") or "").strip()
+        server_type = str(server.get("server_type") or _REMOTE_SERVER_TYPE_SSE).strip().lower()
+        server_type_label = _REMOTE_SERVER_TYPES.get(server_type, server_type or "unknown")
         header = f"Server: {server_name} (id={server_id}"
+        if server_type_label:
+            header += f", type={server_type_label}"
         if server_url:
             header += f", url={server_url}"
+        openapi_url = str(server.get("openapi_url") or "").strip()
+        if openapi_url and server_type == _REMOTE_SERVER_TYPE_MCPO:
+            header += f", openapi={openapi_url}"
         header += ")"
         lines.append(header)
 
@@ -332,31 +589,100 @@ def _summarize_remote_mcp_tools_for_prompt(remote_servers: list[dict[str, Any]],
     return "\n".join(lines).strip()
 
 
-def _route_remote_mcp_request_with_llm(llm, message: str, remote_servers: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _summarize_tool_history_for_prompt(
+    tool_history: list[dict[str, Any]] | None,
+    *,
+    max_entries: int = _REMOTE_TOOL_HISTORY_MAX_ENTRIES,
+) -> str:
+    if not tool_history:
+        return ""
+    lines: list[str] = []
+    entries = tool_history[-max_entries:]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        server_label = str(entry.get("server") or entry.get("server_id") or "server").strip()
+        tool_name = str(entry.get("tool") or "").strip()
+        args = entry.get("arguments") if isinstance(entry.get("arguments"), dict) else {}
+        result = entry.get("result")
+        try:
+            args_text = json.dumps(args, ensure_ascii=True, separators=(",", ":"))
+        except Exception:
+            args_text = str(args)
+        args_text = _truncate_text(args_text, 180)
+        result_text = _truncate_text(str(result or ""), _REMOTE_TOOL_RESULT_MAX_CHARS)
+        lines.append(f"- {server_label}::{tool_name} args={args_text} result={result_text}")
+    return "\n".join(lines).strip()
+
+
+def _route_remote_mcp_request_with_llm(
+    llm,
+    message: str,
+    remote_servers: list[dict[str, Any]],
+    tool_history: list[dict[str, Any]] | None = None,
+    *,
+    allow_tool_calls: bool = True,
+    allow_final: bool = True,
+    force_final: bool = False,
+) -> dict[str, Any] | None:
     tools_summary = _summarize_remote_mcp_tools_for_prompt(remote_servers)
     if not tools_summary:
         return None
-    system = SystemMessage(
-        content=(
+
+    history_summary = _summarize_tool_history_for_prompt(tool_history)
+    tool_history_block = f"\nTool call history:\n{history_summary}\n" if history_summary else ""
+
+    if force_final:
+        system_text = (
+            "You are a router for Sat.AI.\n"
+            "You have already called tools and must provide the final response now.\n"
+            "Use the tool results below to answer.\n"
+            f"{tool_history_block}\n"
+            "Output ONLY valid JSON:\n"
+            '  {"action":"final","answer":"<response>"}\n\n'
+            "Rules:\n"
+            "- Only output JSON. No markdown, no backticks, no extra text.\n"
+        )
+    else:
+        action_lines = []
+        if allow_tool_calls:
+            action_lines.append(
+                '- If tools above can answer or fetch data for the request, output ONLY JSON:\n'
+                '  {"action":"mcp","server_id":"<id>","tool_name":"<name>","arguments":{...}}\n'
+            )
+        if allow_final:
+            action_lines.append(
+                '- If you have enough info (especially after tool calls), output ONLY JSON:\n'
+                '  {"action":"final","answer":"<response>"}\n'
+            )
+        action_lines.append(
+            '- If they want a tool but required arguments are missing/unclear, output ONLY JSON:\n'
+            '  {"action":"clarify","question":"<ask for the missing inputs>"}\n'
+        )
+        action_lines.append(
+            '- If the user is asking about NOS3 documentation or no tools apply, output ONLY JSON:\n'
+            '  {"action":"chat"}\n'
+        )
+
+        system_text = (
             "You are a router for Sat.AI.\n"
             "Sat.AI can either:\n"
-            "1) Answer questions about the NOS3 documentation.\n"
+            "1) Answer questions about the NOS3 documentation (handled elsewhere).\n"
             "2) Call a tool on a remote MCP server (listed below).\n\n"
             "Available remote MCP tools:\n"
-            f"{tools_summary}\n\n"
+            f"{tools_summary}\n"
+            f"{tool_history_block}\n"
             "Decide what to do for the user's message.\n"
-            "- If the user is asking to call/run one of the tools above, output ONLY valid JSON:\n"
-            '  {"action":"mcp","server_id":"<id>","tool_name":"<name>","arguments":{...}}\n'
-            "- If they want a tool but required arguments are missing/unclear, output ONLY valid JSON:\n"
-            '  {"action":"clarify","question":"<ask for the missing inputs>"}\n'
-            "- Otherwise output ONLY valid JSON:\n"
-            '  {"action":"chat"}\n\n'
-            "Rules:\n"
+            "You can call multiple tools in sequence when needed. After each tool call, you will be asked again with the tool results.\n"
+            "Choose tools even when the user does not mention the tool name, if a tool clearly fits the request.\n"
+            + "\n".join(action_lines)
+            + "\nRules:\n"
             "- Only output JSON. No markdown, no backticks, no extra text.\n"
             "- Never invent server_id or tool_name.\n"
             "- arguments must be a JSON object (use {} if the tool takes no arguments).\n"
         )
-    )
+
+    system = SystemMessage(content=system_text)
     human = HumanMessage(content=message)
     try:
         response = llm.invoke([system, human])
@@ -479,6 +805,7 @@ class WebConfig:
 _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_MCP_REGISTRY_PATH = _REPO_ROOT / "storage" / "remote_mcp_servers.json"
 _REMOTE_MCP_REGISTRY_LOCK = threading.Lock()
+_ROUTER_KEY_LOCK = threading.Lock()
 
 
 def _resolve_repo_path(raw: str) -> Path:
@@ -519,6 +846,11 @@ def _load_remote_mcp_registry(path: Path) -> Dict[str, Dict[str, Any]]:
         url = str(item.get("url") or "").strip()
         if not server_id or not name or not url:
             continue
+        server_type = str(item.get("server_type") or _REMOTE_SERVER_TYPE_SSE).strip().lower()
+        if server_type not in _REMOTE_SERVER_TYPES:
+            server_type = _REMOTE_SERVER_TYPE_SSE
+        openapi_url_raw = item.get("openapi_url")
+        openapi_url = str(openapi_url_raw) if isinstance(openapi_url_raw, str) and openapi_url_raw.strip() else None
         protocol_version = str(item.get("protocol_version") or "2024-11-05").strip() or "2024-11-05"
         try:
             init_timeout_s = float(item.get("init_timeout_s") or 30.0)
@@ -541,6 +873,8 @@ def _load_remote_mcp_registry(path: Path) -> Dict[str, Dict[str, Any]]:
             "id": server_id,
             "name": name,
             "url": url,
+            "server_type": server_type,
+            "openapi_url": openapi_url,
             "protocol_version": protocol_version,
             "init_timeout_s": init_timeout_s,
             "enabled": enabled,
@@ -627,7 +961,8 @@ HTML_PAGE = """<!DOCTYPE html>
     .message .content th { background: #1d2f48; color: #c7d5eb; }
     .message .content ul, .message .content ol { margin: 0 0 12px 20px; padding-left: 12px; }
     .message .content blockquote { border-left: 4px solid rgba(61, 126, 255, 0.5); padding-left: 12px; color: #c7d5eb; margin: 0 0 12px; }
-    .provider-tag { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 4px 10px; border-radius: 999px; background: rgba(61, 126, 255, 0.12); color: #9ebcff; font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; }
+    .provider-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .provider-tag { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; background: rgba(61, 126, 255, 0.12); color: #9ebcff; font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; }
     .provider-tag::before { content: "↺"; font-size: 0.8rem; }
     .chat-form { display: flex; gap: 12px; }
     .chat-form input { flex: 1; padding: 14px 18px; border-radius: 999px; border: 1px solid #274268; background: #0f1e32; color: #f4f6fb; font-size: 1rem; }
@@ -829,9 +1164,24 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
           </div>
           <div>
+            <label class="settings-label" for="mcp-remote-type">Server Type</label>
+            <div class="input-row">
+              <select id="mcp-remote-type" class="model-select">
+                <option value="mcp_sse">MCP SSE</option>
+                <option value="mcpo">MCPO (OpenAPI)</option>
+              </select>
+            </div>
+          </div>
+          <div>
             <label class="settings-label" for="mcp-remote-url">Server URL (HTTP)</label>
             <div class="input-row">
               <input id="mcp-remote-url" type="text" placeholder="http://localhost:8001" autocomplete="off" />
+            </div>
+          </div>
+          <div id="mcp-remote-openapi-row">
+            <label class="settings-label" for="mcp-remote-openapi">OpenAPI URL (optional)</label>
+            <div class="input-row">
+              <input id="mcp-remote-openapi" type="text" placeholder="http://localhost:8000/openapi.json" autocomplete="off" />
             </div>
           </div>
           <div id="mcp-remote-status" class="mcp-log-path"></div>
@@ -865,6 +1215,11 @@ HTML_PAGE = """<!DOCTYPE html>
         { id: "groq", label: "Groq", placeholder: "gsk-..." },
         { id: "sambanova", label: "SambaNova", placeholder: "sn-..." },
       ];
+      const REMOTE_MCP_TYPE_LABELS = {
+        mcp_sse: "MCP SSE",
+        mcpo: "MCPO (OpenAPI)",
+      };
+      const DEFAULT_REMOTE_MCP_TYPE = "mcp_sse";
 
       const providerState = {};
       const embeddingsState = {
@@ -892,7 +1247,10 @@ HTML_PAGE = """<!DOCTYPE html>
       };
       const remoteMcpState = {
         nameInput: null,
+        typeSelect: null,
         urlInput: null,
+        openapiInput: null,
+        openapiRow: null,
         addButton: null,
         refreshButton: null,
         statusBox: null,
@@ -1000,10 +1358,32 @@ HTML_PAGE = """<!DOCTYPE html>
 
       const appendProviderTag = (node, provider, model) => {
         if (!node || !provider) return;
+        const wrapper = document.createElement("div");
+        wrapper.className = "provider-tags";
         const badge = document.createElement("div");
         badge.className = "provider-tag";
         badge.textContent = model ? `${provider} · ${model}` : `Served by ${provider}`;
-        node.appendChild(badge);
+        wrapper.appendChild(badge);
+        node.appendChild(wrapper);
+      };
+
+      const appendToolCalls = (node, toolCalls) => {
+        if (!node || !Array.isArray(toolCalls) || !toolCalls.length) return;
+        const wrapper = document.createElement("div");
+        wrapper.className = "provider-tags";
+        toolCalls.forEach((call) => {
+          if (!call) return;
+          const provider = call.provider ? String(call.provider) : "MCP";
+          const model = call.model ? String(call.model) : "";
+          const server = call.server ? String(call.server) : "";
+          let label = model ? `${provider} · ${model}` : provider;
+          if (server) label = `${label} · ${server}`;
+          const badge = document.createElement("div");
+          badge.className = "provider-tag";
+          badge.textContent = label;
+          wrapper.appendChild(badge);
+        });
+        if (wrapper.childElementCount) node.appendChild(wrapper);
       };
 
 	      const refreshProviderDisabled = () => {
@@ -1623,29 +2003,73 @@ HTML_PAGE = """<!DOCTYPE html>
 	        remoteMcpState.statusBox.classList.toggle("error", Boolean(isError && message));
 	      };
 
-	      const formatRemoteTestStamp = (seconds) => {
-	        const value = Number(seconds);
-	        if (!Number.isFinite(value) || value <= 0) return "never";
-	        return new Date(value * 1000).toLocaleString();
-	      };
+      const formatRemoteTestStamp = (seconds) => {
+        const value = Number(seconds);
+        if (!Number.isFinite(value) || value <= 0) return "never";
+        return new Date(value * 1000).toLocaleString();
+      };
 
-	      const renderRemoteMcpTools = (server, extra) => {
-	        if (!remoteMcpState.toolsBox) return;
-	        remoteMcpState.toolsBox.innerHTML = "";
-	        if (!server) {
-	          remoteMcpState.toolsBox.textContent = "Select a server to view tools.";
-	          return;
-	        }
+      const normalizeRemoteMcpType = (value) => {
+        const key = String(value || "").trim().toLowerCase();
+        return REMOTE_MCP_TYPE_LABELS[key] ? key : DEFAULT_REMOTE_MCP_TYPE;
+      };
 
-	        const header = document.createElement("div");
-	        const name = server.name ? String(server.name) : "Remote MCP server";
-	        header.textContent = `${name} · ${server.url || ""}`.trim();
-	        remoteMcpState.toolsBox.appendChild(header);
+      const remoteMcpTypeLabel = (value) => {
+        const key = normalizeRemoteMcpType(value);
+        return REMOTE_MCP_TYPE_LABELS[key] || "MCP SSE";
+      };
 
-	        const meta = document.createElement("div");
-	        const enabled = server.enabled !== false;
-	        const toolCount = Array.isArray(server.tools) ? server.tools.length : 0;
-	        const lastTest = formatRemoteTestStamp(server.last_test_s);
+      const suggestOpenapiUrl = () => {
+        if (!remoteMcpState.typeSelect || !remoteMcpState.urlInput || !remoteMcpState.openapiInput) return;
+        if (normalizeRemoteMcpType(remoteMcpState.typeSelect.value) !== "mcpo") return;
+        if (remoteMcpState.openapiInput.value.trim()) return;
+        const raw = remoteMcpState.urlInput.value.trim();
+        if (!raw) return;
+        if (raw.endsWith("/openapi.json")) {
+          remoteMcpState.openapiInput.value = raw;
+          return;
+        }
+        remoteMcpState.openapiInput.value = raw.replace(/\/+$/, "") + "/openapi.json";
+      };
+
+      const refreshRemoteMcpForm = () => {
+        if (!remoteMcpState.typeSelect || !remoteMcpState.openapiRow || !remoteMcpState.openapiInput) return;
+        const type = normalizeRemoteMcpType(remoteMcpState.typeSelect.value);
+        remoteMcpState.typeSelect.value = type;
+        if (type === "mcpo") {
+          remoteMcpState.openapiRow.style.display = "block";
+          suggestOpenapiUrl();
+        } else {
+          remoteMcpState.openapiRow.style.display = "none";
+          remoteMcpState.openapiInput.value = "";
+        }
+      };
+
+      const renderRemoteMcpTools = (server, extra) => {
+        if (!remoteMcpState.toolsBox) return;
+        remoteMcpState.toolsBox.innerHTML = "";
+        if (!server) {
+          remoteMcpState.toolsBox.textContent = "Select a server to view tools.";
+          return;
+        }
+
+        const header = document.createElement("div");
+        const name = server.name ? String(server.name) : "Remote MCP server";
+        const typeLabel = remoteMcpTypeLabel(server.server_type);
+        const urlText = server.url || "";
+        header.textContent = `${name} · ${typeLabel}${urlText ? " · " + urlText : ""}`.trim();
+        remoteMcpState.toolsBox.appendChild(header);
+
+        if (normalizeRemoteMcpType(server.server_type) === "mcpo" && server.openapi_url) {
+          const openapiLine = document.createElement("div");
+          openapiLine.textContent = `OpenAPI: ${String(server.openapi_url)}`;
+          remoteMcpState.toolsBox.appendChild(openapiLine);
+        }
+
+        const meta = document.createElement("div");
+        const enabled = server.enabled !== false;
+        const toolCount = Array.isArray(server.tools) ? server.tools.length : 0;
+        const lastTest = formatRemoteTestStamp(server.last_test_s);
 	        meta.textContent = `Status: ${enabled ? "enabled" : "disabled"} · Tools cached: ${toolCount} · Last test: ${lastTest}`;
 	        remoteMcpState.toolsBox.appendChild(meta);
 
@@ -1737,13 +2161,15 @@ HTML_PAGE = """<!DOCTYPE html>
 	          button.type = "button";
 	          button.className = "mcp-log-item mcp-remote-server";
 	          if (server.id === remoteMcpState.selectedId) button.classList.add("selected");
-	          const enabled = server.enabled !== false;
-	          const toolCount = Array.isArray(server.tools) ? server.tools.length : 0;
-	          const stamp = formatRemoteTestStamp(server.last_test_s);
-	          const parts = [`${toolCount} tool${toolCount === 1 ? "" : "s"}`, `last test: ${stamp}`];
-	          if (!enabled) parts.push("disabled");
-	          if (server.last_error) parts.push("error");
-	          button.textContent = `${server.name || server.id} — ${server.url || ""} (${parts.join("; ")})`.trim();
+          const enabled = server.enabled !== false;
+          const toolCount = Array.isArray(server.tools) ? server.tools.length : 0;
+          const stamp = formatRemoteTestStamp(server.last_test_s);
+          const parts = [`${toolCount} tool${toolCount === 1 ? "" : "s"}`, `last test: ${stamp}`];
+          if (!enabled) parts.push("disabled");
+          if (server.last_error) parts.push("error");
+          const typeLabel = remoteMcpTypeLabel(server.server_type);
+          const urlText = server.url || "";
+          button.textContent = `${server.name || server.id} — ${typeLabel}${urlText ? " · " + urlText : ""} (${parts.join("; ")})`.trim();
 	          button.addEventListener("click", () => selectRemoteMcpServer(server.id));
 	          remoteMcpState.serversBox.appendChild(button);
 	        });
@@ -1786,25 +2212,32 @@ HTML_PAGE = """<!DOCTYPE html>
 	        }
 	      };
 
-	      const addRemoteMcpServer = async () => {
-	        if (!remoteMcpState.nameInput || !remoteMcpState.urlInput) return;
-	        const name = (remoteMcpState.nameInput.value || "").trim();
-	        const url = (remoteMcpState.urlInput.value || "").trim();
-	        if (!name || !url) {
-	          updateSettingsStatus("Provide both a name and server URL.", true);
-	          setRemoteMcpStatus("Provide both a name and server URL.", true);
-	          return;
-	        }
-	        remoteMcpState.loading = true;
-	        refreshProviderDisabled();
-	        updateSettingsStatus("Adding remote MCP server...");
-	        setRemoteMcpStatus("Adding server...");
-	        try {
-	          const response = await fetch("/api/mcp/remote", {
-	            method: "POST",
-	            headers: { "Content-Type": "application/json" },
-	            body: JSON.stringify({ name, url }),
-	          });
+      const addRemoteMcpServer = async () => {
+        if (!remoteMcpState.nameInput || !remoteMcpState.urlInput || !remoteMcpState.typeSelect) return;
+        const name = (remoteMcpState.nameInput.value || "").trim();
+        const url = (remoteMcpState.urlInput.value || "").trim();
+        const serverType = normalizeRemoteMcpType(remoteMcpState.typeSelect.value);
+        const openapiUrl = remoteMcpState.openapiInput ? (remoteMcpState.openapiInput.value || "").trim() : "";
+        if (!name || !url) {
+          updateSettingsStatus("Provide both a name and server URL.", true);
+          setRemoteMcpStatus("Provide both a name and server URL.", true);
+          return;
+        }
+        remoteMcpState.loading = true;
+        refreshProviderDisabled();
+        updateSettingsStatus("Adding remote MCP server...");
+        setRemoteMcpStatus("Adding server...");
+        try {
+          const response = await fetch("/api/mcp/remote", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              name,
+              url,
+              server_type: serverType,
+              openapi_url: serverType === "mcpo" && openapiUrl ? openapiUrl : null,
+            }),
+          });
 	          if (!response.ok) {
 	            let detail = "Failed to add remote MCP server.";
 	            try {
@@ -1815,12 +2248,15 @@ HTML_PAGE = """<!DOCTYPE html>
 	            setRemoteMcpStatus(detail, true);
 	            return;
 	          }
-	          const server = await response.json();
-	          remoteMcpState.nameInput.value = "";
-	          remoteMcpState.urlInput.value = "";
-	          await fetchRemoteMcpServers();
-	          if (server && server.id) selectRemoteMcpServer(server.id);
-	          updateSettingsStatus("Remote MCP server added.");
+          const server = await response.json();
+          remoteMcpState.nameInput.value = "";
+          remoteMcpState.urlInput.value = "";
+          if (remoteMcpState.openapiInput) remoteMcpState.openapiInput.value = "";
+          if (remoteMcpState.typeSelect) remoteMcpState.typeSelect.value = DEFAULT_REMOTE_MCP_TYPE;
+          refreshRemoteMcpForm();
+          await fetchRemoteMcpServers();
+          if (server && server.id) selectRemoteMcpServer(server.id);
+          updateSettingsStatus("Remote MCP server added.");
 	        } catch (error) {
 	          console.error(error);
 	          updateSettingsStatus("Error adding remote MCP server. See console for details.", true);
@@ -1871,25 +2307,27 @@ HTML_PAGE = """<!DOCTYPE html>
 	        }
 	      };
 
-	      const toggleRemoteMcpServer = async (server) => {
-	        if (!server || !server.id) return;
-	        remoteMcpState.loading = true;
-	        refreshProviderDisabled();
-	        updateSettingsStatus("Updating remote MCP server...");
-	        setRemoteMcpStatus("Updating server...");
-	        try {
-	          const response = await fetch("/api/mcp/remote", {
-	            method: "POST",
-	            headers: { "Content-Type": "application/json" },
-	            body: JSON.stringify({
-	              id: server.id,
-	              name: server.name,
-	              url: server.url,
-	              protocol_version: server.protocol_version || "2024-11-05",
-	              init_timeout_s: server.init_timeout_s != null ? server.init_timeout_s : 30,
-	              enabled: !(server.enabled !== false),
-	            }),
-	          });
+      const toggleRemoteMcpServer = async (server) => {
+        if (!server || !server.id) return;
+        remoteMcpState.loading = true;
+        refreshProviderDisabled();
+        updateSettingsStatus("Updating remote MCP server...");
+        setRemoteMcpStatus("Updating server...");
+        try {
+          const response = await fetch("/api/mcp/remote", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              id: server.id,
+              name: server.name,
+              url: server.url,
+              server_type: normalizeRemoteMcpType(server.server_type),
+              openapi_url: server.openapi_url || null,
+              protocol_version: server.protocol_version || "2024-11-05",
+              init_timeout_s: server.init_timeout_s != null ? server.init_timeout_s : 30,
+              enabled: !(server.enabled !== false),
+            }),
+          });
 	          if (!response.ok) {
 	            let detail = "Failed to update remote MCP server.";
 	            try {
@@ -1953,25 +2391,47 @@ HTML_PAGE = """<!DOCTYPE html>
 	        }
 	      };
 
-	      const initRemoteMcp = () => {
-	        remoteMcpState.nameInput = document.getElementById("mcp-remote-name");
-	        remoteMcpState.urlInput = document.getElementById("mcp-remote-url");
-	        remoteMcpState.addButton = document.getElementById("add-mcp-remote");
-	        remoteMcpState.refreshButton = document.getElementById("refresh-mcp-remote");
-	        remoteMcpState.statusBox = document.getElementById("mcp-remote-status");
-	        remoteMcpState.serversBox = document.getElementById("mcp-remote-servers");
-	        remoteMcpState.toolsBox = document.getElementById("mcp-remote-tools");
-	        remoteMcpState.servers = [];
+      const initRemoteMcp = () => {
+        remoteMcpState.nameInput = document.getElementById("mcp-remote-name");
+        remoteMcpState.typeSelect = document.getElementById("mcp-remote-type");
+        remoteMcpState.urlInput = document.getElementById("mcp-remote-url");
+        remoteMcpState.openapiInput = document.getElementById("mcp-remote-openapi");
+        remoteMcpState.openapiRow = document.getElementById("mcp-remote-openapi-row");
+        remoteMcpState.addButton = document.getElementById("add-mcp-remote");
+        remoteMcpState.refreshButton = document.getElementById("refresh-mcp-remote");
+        remoteMcpState.statusBox = document.getElementById("mcp-remote-status");
+        remoteMcpState.serversBox = document.getElementById("mcp-remote-servers");
+        remoteMcpState.toolsBox = document.getElementById("mcp-remote-tools");
+        remoteMcpState.servers = [];
 
-	        if (!remoteMcpState.nameInput || !remoteMcpState.urlInput || !remoteMcpState.addButton || !remoteMcpState.refreshButton || !remoteMcpState.statusBox || !remoteMcpState.serversBox || !remoteMcpState.toolsBox) {
-	          console.warn("Remote MCP configuration elements missing from the page.");
-	          return;
-	        }
+        if (
+          !remoteMcpState.nameInput ||
+          !remoteMcpState.typeSelect ||
+          !remoteMcpState.urlInput ||
+          !remoteMcpState.openapiInput ||
+          !remoteMcpState.openapiRow ||
+          !remoteMcpState.addButton ||
+          !remoteMcpState.refreshButton ||
+          !remoteMcpState.statusBox ||
+          !remoteMcpState.serversBox ||
+          !remoteMcpState.toolsBox
+        ) {
+          console.warn("Remote MCP configuration elements missing from the page.");
+          return;
+        }
 
-	        remoteMcpState.refreshButton.addEventListener("click", () => fetchRemoteMcpServers());
-	        remoteMcpState.addButton.addEventListener("click", () => addRemoteMcpServer());
-	        fetchRemoteMcpServers();
-	      };
+        remoteMcpState.refreshButton.addEventListener("click", () => fetchRemoteMcpServers());
+        remoteMcpState.addButton.addEventListener("click", () => addRemoteMcpServer());
+        remoteMcpState.typeSelect.addEventListener("change", () => refreshRemoteMcpForm());
+        remoteMcpState.urlInput.addEventListener("blur", () => suggestOpenapiUrl());
+        remoteMcpState.urlInput.addEventListener("input", () => {
+          if (normalizeRemoteMcpType(remoteMcpState.typeSelect.value) === "mcpo") {
+            suggestOpenapiUrl();
+          }
+        });
+        refreshRemoteMcpForm();
+        fetchRemoteMcpServers();
+      };
 
 	      const loadInitialEmbeddings = async () => {
 	        try {
@@ -2103,7 +2563,11 @@ HTML_PAGE = """<!DOCTYPE html>
           const data = await response.json();
           history = data.history || history;
           const assistantNode = appendMessage("assistant", data.answer || "No answer returned.");
-          appendProviderTag(assistantNode, data.provider, data.model);
+          if (Array.isArray(data.tool_calls) && data.tool_calls.length) {
+            appendToolCalls(assistantNode, data.tool_calls);
+          } else {
+            appendProviderTag(assistantNode, data.provider, data.model);
+          }
           const providerKey = (data.provider_id || "").toLowerCase();
           if (providerKey && providerState[providerKey] && data.model) {
             const state = providerState[providerKey];
@@ -2164,6 +2628,7 @@ class ChatResponse(BaseModel):
     provider: str | None = None
     model: str | None = None
     provider_id: str | None = None
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ProviderModelRequest(BaseModel):
@@ -2244,6 +2709,8 @@ class RemoteMcpServerCreateRequest(BaseModel):
     id: str | None = None
     name: str = Field(..., min_length=1)
     url: str = Field(..., min_length=1)
+    server_type: str = Field(_REMOTE_SERVER_TYPE_SSE, min_length=1)
+    openapi_url: str | None = None
     protocol_version: str = Field("2024-11-05", min_length=1)
     init_timeout_s: float = Field(30.0, ge=0.1, le=300.0)
     enabled: bool = True
@@ -2253,6 +2720,8 @@ class RemoteMcpServerInfo(BaseModel):
     id: str
     name: str
     url: str
+    server_type: str = Field(_REMOTE_SERVER_TYPE_SSE, min_length=1)
+    openapi_url: str | None = None
     protocol_version: str = Field("2024-11-05", min_length=1)
     init_timeout_s: float = Field(30.0, ge=0.1, le=300.0)
     enabled: bool = True
@@ -2536,6 +3005,7 @@ def create_app(config: WebConfig) -> FastAPI:
     app.state.chain_cache: Dict[Tuple[str, str, str], ConversationalRetrievalChain] = {}
     app.state.key_ring: List[Tuple[str, str]] = []
     app.state.key_index: int = 0
+    app.state.router_key_index: int = 0
     app.state.startup_error: str | None = None
     app.state.provider_catalog: Dict[str, List[str]] = {
         "cerebras": _merge_candidates(config.cerebras_models, DEFAULT_MODEL_CANDIDATES["cerebras"]),
@@ -2907,6 +3377,8 @@ def create_app(config: WebConfig) -> FastAPI:
     def upsert_remote_mcp_server(request: RemoteMcpServerCreateRequest) -> RemoteMcpServerInfo:
         name = request.name.strip()
         url = request.url.strip()
+        server_type = (request.server_type or _REMOTE_SERVER_TYPE_SSE).strip().lower()
+        openapi_url = (request.openapi_url or "").strip() or None
         protocol_version = request.protocol_version.strip()
         init_timeout_s = float(request.init_timeout_s)
         enabled = bool(request.enabled)
@@ -2915,17 +3387,26 @@ def create_app(config: WebConfig) -> FastAPI:
             raise HTTPException(status_code=400, detail="name cannot be empty.")
         if not url:
             raise HTTPException(status_code=400, detail="url cannot be empty.")
-        if not protocol_version:
-            raise HTTPException(status_code=400, detail="protocol_version cannot be empty.")
-        try:
-            _ = RemoteMCPServerConfig(
-                name=name,
-                url=url,
-                protocol_version=protocol_version,
-                init_timeout_s=init_timeout_s,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=400, detail=f"Invalid MCP server settings: {exc}") from exc
+        if server_type not in _REMOTE_SERVER_TYPES:
+            raise HTTPException(status_code=400, detail=f"Unsupported server_type '{server_type}'.")
+        if server_type == _REMOTE_SERVER_TYPE_MCPO:
+            try:
+                url, openapi_url = resolve_openapi_urls(url, openapi_url)
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail=f"Invalid MCPO settings: {exc}") from exc
+        else:
+            openapi_url = None
+            if not protocol_version:
+                raise HTTPException(status_code=400, detail="protocol_version cannot be empty.")
+            try:
+                _ = RemoteMCPServerConfig(
+                    name=name,
+                    url=url,
+                    protocol_version=protocol_version,
+                    init_timeout_s=init_timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail=f"Invalid MCP server settings: {exc}") from exc
 
         with _REMOTE_MCP_REGISTRY_LOCK:
             server_id = (request.id or "").strip()
@@ -2937,6 +3418,8 @@ def create_app(config: WebConfig) -> FastAPI:
                     {
                         "name": name,
                         "url": url,
+                        "server_type": server_type,
+                        "openapi_url": openapi_url,
                         "protocol_version": protocol_version,
                         "init_timeout_s": init_timeout_s,
                         "enabled": enabled,
@@ -2953,6 +3436,8 @@ def create_app(config: WebConfig) -> FastAPI:
                 "id": server_id,
                 "name": name,
                 "url": url,
+                "server_type": server_type,
+                "openapi_url": openapi_url,
                 "protocol_version": protocol_version,
                 "init_timeout_s": init_timeout_s,
                 "enabled": enabled,
@@ -2981,16 +3466,30 @@ def create_app(config: WebConfig) -> FastAPI:
             entry = app.state.remote_mcp_servers.get(server_id)
             if entry is None:
                 raise HTTPException(status_code=404, detail=f"Unknown MCP server id: {server_id}")
-            config = RemoteMCPServerConfig(
-                name=entry.get("name") or server_id,
-                url=entry.get("url") or "",
-                protocol_version=entry.get("protocol_version") or "2024-11-05",
-                init_timeout_s=float(entry.get("init_timeout_s") or 30.0),
-            )
+            server_type = str(entry.get("server_type") or _REMOTE_SERVER_TYPE_SSE).strip().lower()
+            if server_type not in _REMOTE_SERVER_TYPES:
+                server_type = _REMOTE_SERVER_TYPE_SSE
+            config: RemoteMCPServerConfig | MCPOServerConfig
+            if server_type == _REMOTE_SERVER_TYPE_MCPO:
+                config = MCPOServerConfig(
+                    name=entry.get("name") or server_id,
+                    base_url=entry.get("url") or "",
+                    openapi_url=entry.get("openapi_url"),
+                )
+            else:
+                config = RemoteMCPServerConfig(
+                    name=entry.get("name") or server_id,
+                    url=entry.get("url") or "",
+                    protocol_version=entry.get("protocol_version") or "2024-11-05",
+                    init_timeout_s=float(entry.get("init_timeout_s") or 30.0),
+                )
 
         try:
-            result = await run_in_threadpool(test_remote_mcp_connection, config=config)
-        except RemoteMCPError as exc:
+            if server_type == _REMOTE_SERVER_TYPE_MCPO:
+                result = await run_in_threadpool(test_mcpo_connection, config=config)
+            else:
+                result = await run_in_threadpool(test_remote_mcp_connection, config=config)
+        except (RemoteMCPError, MCPOError) as exc:
             with _REMOTE_MCP_REGISTRY_LOCK:
                 entry = app.state.remote_mcp_servers.get(server_id)
                 if entry is not None:
@@ -3005,6 +3504,13 @@ def create_app(config: WebConfig) -> FastAPI:
             if entry is None:
                 raise HTTPException(status_code=404, detail=f"Unknown MCP server id: {server_id}")
             entry["tools"] = tools if isinstance(tools, list) else []
+            if server_type == _REMOTE_SERVER_TYPE_MCPO and isinstance(result, dict):
+                resolved_base = result.get("base_url")
+                resolved_openapi = result.get("openapi_url")
+                if isinstance(resolved_base, str) and resolved_base.strip():
+                    entry["url"] = resolved_base.strip()
+                if isinstance(resolved_openapi, str) and resolved_openapi.strip():
+                    entry["openapi_url"] = resolved_openapi.strip()
             entry["last_test_s"] = time.time()
             entry["last_error"] = None
             _persist_remote_mcp_registry(app.state.remote_mcp_registry_path, app.state.remote_mcp_servers)
@@ -3024,6 +3530,18 @@ def create_app(config: WebConfig) -> FastAPI:
 
         history = list(payload.history)
         chat_history = [(turn.question, turn.answer) for turn in history]
+
+        remote_servers: list[dict[str, Any]] = []
+        with _REMOTE_MCP_REGISTRY_LOCK:
+            for entry in app.state.remote_mcp_servers.values():
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("enabled") is False:
+                    continue
+                tools = entry.get("tools")
+                if not isinstance(tools, list) or not tools:
+                    continue
+                remote_servers.append(dict(entry))
 
         if is_orbit_command(message):
             orbit_args = parse_orbit_command(message)
@@ -3052,6 +3570,7 @@ def create_app(config: WebConfig) -> FastAPI:
                 provider="MCP",
                 model="visualize_orbit",
                 provider_id="satellite-sim",
+                tool_calls=[{"provider": "MCP", "model": "visualize_orbit", "provider_id": "satellite-sim"}],
             )
 
         if _should_attempt_orbit_nl_routing(message, history):
@@ -3071,8 +3590,15 @@ def create_app(config: WebConfig) -> FastAPI:
             router_provider: str | None = None
             router_model: str | None = None
             decision: dict[str, Any] | None = None
+            llm = None
 
-            for provider_name in ("cerebras", "groq", "sambanova"):
+            provider_order = ["cerebras", "groq", "sambanova"]
+            with _ROUTER_KEY_LOCK:
+                start_idx = app.state.router_key_index % len(provider_order)
+                app.state.router_key_index += 1
+
+            for offset in range(len(provider_order)):
+                provider_name = provider_order[(start_idx + offset) % len(provider_order)]
                 key_value = key_map.get(provider_name) or ""
                 if not key_value:
                     continue
@@ -3094,14 +3620,51 @@ def create_app(config: WebConfig) -> FastAPI:
             action = (decision.get("action") if isinstance(decision, dict) else None) or ""
             action = str(action).strip().lower()
 
+            if coords is None and remote_servers and llm is not None and action in {"orbit", "clarify", ""}:
+                tool_context = await _resolve_coords_with_remote_tools(llm, message, remote_servers)
+                coords_from_tools = tool_context.get("coords")
+                if coords_from_tools is not None:
+                    lat_f, lon_f = coords_from_tools
+                    try:
+                        answer, _run_dir_text, _log_path_text = _start_orbit_from_chat(app.state.config, lat_f, lon_f)
+                    except OrbitMCPError as exc:
+                        answer = f"Orbit visualization failed to start: {exc}"
+                    server_label = tool_context.get("last_server_label") or "remote tool"
+                    tool_name = tool_context.get("last_tool_name") or "lookup"
+                    prefix = f"Coordinates from {server_label}::{tool_name}: {lat_f:.5f}, {lon_f:.5f}.\n"
+                    answer = prefix + answer
+                    updated_history = history + [ChatTurn(question=message, answer=answer)]
+                    tool_calls = _tool_calls_from_history(tool_context.get("tool_history") or [])
+                    tool_calls.append({"provider": "MCP", "model": "visualize_orbit", "provider_id": "satellite-sim"})
+                    return ChatResponse(
+                        answer=answer,
+                        sources=[],
+                        history=updated_history,
+                        provider="MCP",
+                        model="visualize_orbit",
+                        provider_id="satellite-sim",
+                        tool_calls=tool_calls,
+                    )
+
+                clarify_question = tool_context.get("clarify")
+                if isinstance(clarify_question, str) and clarify_question.strip() and action == "clarify":
+                    answer = clarify_question.strip()
+                    updated_history = history + [ChatTurn(question=message, answer=answer)]
+                    provider_label = PROVIDER_LABELS.get(router_provider or "", router_provider) if router_provider else None
+                    return ChatResponse(
+                        answer=answer,
+                        sources=[],
+                        history=updated_history,
+                        provider=provider_label,
+                        model=router_model,
+                        provider_id="orbit-router",
+                    )
+
             if action == "orbit":
-                lat = decision.get("latitude") if isinstance(decision, dict) else None
-                lon = decision.get("longitude") if isinstance(decision, dict) else None
-                try:
-                    lat_f = float(lat)
-                    lon_f = float(lon)
-                except Exception:
-                    lat_f = lon_f = None  # type: ignore[assignment]
+                lat_f: float | None = None
+                lon_f: float | None = None
+                if coords is not None:
+                    lat_f, lon_f = coords
 
                 if isinstance(lat_f, float) and isinstance(lon_f, float) and -90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0:
                     try:
@@ -3116,22 +3679,7 @@ def create_app(config: WebConfig) -> FastAPI:
                         provider="MCP",
                         model="visualize_orbit",
                         provider_id="satellite-sim",
-                    )
-
-                if coords is not None:
-                    lat_f, lon_f = coords
-                    try:
-                        answer, _run_dir_text, _log_path_text = _start_orbit_from_chat(app.state.config, lat_f, lon_f)
-                    except OrbitMCPError as exc:
-                        answer = f"Orbit visualization failed to start: {exc}"
-                    updated_history = history + [ChatTurn(question=message, answer=answer)]
-                    return ChatResponse(
-                        answer=answer,
-                        sources=[],
-                        history=updated_history,
-                        provider="MCP",
-                        model="visualize_orbit",
-                        provider_id="satellite-sim",
+                        tool_calls=[{"provider": "MCP", "model": "visualize_orbit", "provider_id": "satellite-sim"}],
                     )
 
                 hint = "To run the orbit simulation, include a target latitude and longitude (degrees), e.g. `/orbit 20 -110`."
@@ -3177,6 +3725,7 @@ def create_app(config: WebConfig) -> FastAPI:
                     provider="MCP",
                     model="visualize_orbit",
                     provider_id="satellite-sim",
+                    tool_calls=[{"provider": "MCP", "model": "visualize_orbit", "provider_id": "satellite-sim"}],
                 )
 
             if coords is None:
@@ -3191,18 +3740,6 @@ def create_app(config: WebConfig) -> FastAPI:
                     model="visualize_orbit",
                     provider_id="satellite-sim",
                 )
-
-        remote_servers: list[dict[str, Any]] = []
-        with _REMOTE_MCP_REGISTRY_LOCK:
-            for entry in app.state.remote_mcp_servers.values():
-                if not isinstance(entry, dict):
-                    continue
-                if entry.get("enabled") is False:
-                    continue
-                tools = entry.get("tools")
-                if not isinstance(tools, list) or not tools:
-                    continue
-                remote_servers.append(dict(entry))
 
         if remote_servers and _should_attempt_remote_mcp_routing(message, history, remote_servers):
             request_model_overrides = {
@@ -3219,9 +3756,15 @@ def create_app(config: WebConfig) -> FastAPI:
 
             router_provider: str | None = None
             router_model: str | None = None
-            decision: dict[str, Any] | None = None
+            llm = None
 
-            for provider_name in ("cerebras", "groq", "sambanova"):
+            provider_order = ["cerebras", "groq", "sambanova"]
+            with _ROUTER_KEY_LOCK:
+                start_idx = app.state.router_key_index % len(provider_order)
+                app.state.router_key_index += 1
+
+            for offset in range(len(provider_order)):
+                provider_name = provider_order[(start_idx + offset) % len(provider_order)]
                 key_value = key_map.get(provider_name) or ""
                 if not key_value:
                     continue
@@ -3234,91 +3777,185 @@ def create_app(config: WebConfig) -> FastAPI:
                     llm = _create_router_llm(provider_name, model_value, key_value)
                 except Exception:
                     continue
-                decision = await run_in_threadpool(_route_remote_mcp_request_with_llm, llm, message, remote_servers)
                 router_provider = provider_name
                 router_model = model_value
-                if decision is not None:
-                    break
+                break
 
-            action = (decision.get("action") if isinstance(decision, dict) else None) or ""
-            action = str(action).strip().lower()
+            if llm is not None:
+                tool_history: list[dict[str, Any]] = []
+                tool_calls = 0
+                used_servers: set[str] = set()
+                last_provider_id: str | None = None
+                last_tool_name: str | None = None
 
-            if action == "mcp":
-                server_id = str((decision or {}).get("server_id") or "").strip()
-                tool_name = str((decision or {}).get("tool_name") or (decision or {}).get("tool") or "").strip()
-                args_raw = (decision or {}).get("arguments")
-                arguments = args_raw if isinstance(args_raw, dict) else {}
+                max_calls = _REMOTE_TOOL_MAX_CALLS
+                max_steps = max_calls + 1
 
-                server_entry: dict[str, Any] | None = None
-                with _REMOTE_MCP_REGISTRY_LOCK:
-                    entry = app.state.remote_mcp_servers.get(server_id)
-                    if isinstance(entry, dict) and entry.get("enabled") is not False:
-                        server_entry = dict(entry)
+                for _ in range(max_steps):
+                    allow_tool_calls = tool_calls < max_calls
+                    decision = await run_in_threadpool(
+                        _route_remote_mcp_request_with_llm,
+                        llm,
+                        message,
+                        remote_servers,
+                        tool_history,
+                        allow_tool_calls=allow_tool_calls,
+                        allow_final=True,
+                    )
 
-                if server_entry and tool_name:
-                    tool_ok = False
+                    if not isinstance(decision, dict):
+                        break
+
+                    action = str((decision.get("action") or "")).strip().lower()
+
+                    if action == "chat":
+                        break
+
+                    if action == "clarify":
+                        question = (decision.get("question") if isinstance(decision, dict) else None) or "What inputs should I use for that tool?"
+                        answer = str(question).strip()
+                        updated_history = history + [ChatTurn(question=message, answer=answer)]
+                        provider_label = PROVIDER_LABELS.get(router_provider or "", router_provider) if router_provider else None
+                        return ChatResponse(
+                            answer=answer,
+                            sources=[],
+                            history=updated_history,
+                            provider=provider_label,
+                            model=router_model,
+                            provider_id="remote-mcp-router",
+                        )
+
+                    if action == "final":
+                        if not tool_history:
+                            break
+                        answer = str(decision.get("answer") or "").strip()
+                        if not answer:
+                            break
+                        updated_history = history + [ChatTurn(question=message, answer=answer)]
+                        provider_id = last_provider_id or "remote-tools"
+                        if len(used_servers) > 1:
+                            provider_id = "remote-tools"
+                        return ChatResponse(
+                            answer=answer,
+                            sources=[],
+                            history=updated_history,
+                            provider="MCP",
+                            model=last_tool_name or "remote-tools",
+                            provider_id=provider_id,
+                            tool_calls=_tool_calls_from_history(tool_history),
+                        )
+
+                    if action != "mcp":
+                        break
+                    if not allow_tool_calls:
+                        break
+
+                    server_id = str((decision or {}).get("server_id") or "").strip()
+                    tool_name = str((decision or {}).get("tool_name") or (decision or {}).get("tool") or "").strip()
+                    args_raw = (decision or {}).get("arguments")
+                    arguments = args_raw if isinstance(args_raw, dict) else {}
+
+                    if not server_id or not tool_name:
+                        break
+
+                    server_entry: dict[str, Any] | None = None
+                    with _REMOTE_MCP_REGISTRY_LOCK:
+                        entry = app.state.remote_mcp_servers.get(server_id)
+                        if isinstance(entry, dict) and entry.get("enabled") is not False:
+                            server_entry = dict(entry)
+
+                    if not server_entry:
+                        break
+
+                    tool_entry: dict[str, Any] | None = None
                     tools = server_entry.get("tools")
                     if isinstance(tools, list):
                         for tool in tools:
                             if isinstance(tool, dict) and str(tool.get("name") or "") == tool_name:
-                                tool_ok = True
+                                tool_entry = tool
                                 break
 
-                    if tool_ok:
-                        config = RemoteMCPServerConfig(
-                            name=server_entry.get("name") or server_id,
-                            url=server_entry.get("url") or "",
-                            protocol_version=server_entry.get("protocol_version") or "2024-11-05",
-                            init_timeout_s=float(server_entry.get("init_timeout_s") or 30.0),
+                    if not tool_entry:
+                        break
+
+                    try:
+                        result_text, provider_id = await run_in_threadpool(
+                            _call_remote_tool,
+                            server_entry,
+                            tool_entry,
+                            arguments,
                         )
-                        try:
-                            result_text = await run_in_threadpool(
-                                remote_call_tool_text,
-                                config=config,
-                                name=tool_name,
-                                arguments=arguments,
-                            )
-                        except RemoteMCPError as exc:
-                            answer = f"Remote MCP tool call failed: {exc}"
-                            updated_history = history + [ChatTurn(question=message, answer=answer)]
-                            return ChatResponse(
-                                answer=answer,
-                                sources=[],
-                                history=updated_history,
-                                provider="MCP",
-                                model=tool_name or "tools/call",
-                                provider_id=f"remote-mcp:{server_id}",
-                            )
-
-                        server_label = str(server_entry.get("name") or server_id)
-                        cleaned = (result_text or "").strip()
-                        answer = cleaned if cleaned else f"Remote MCP tool `{tool_name}` completed on `{server_label}`."
-                        if cleaned and not cleaned.lower().startswith(server_label.lower()):
-                            answer = f"[{server_label}] {tool_name}\n{cleaned}"
-
+                    except (RemoteMCPError, MCPOError) as exc:
+                        answer = f"Remote MCP tool call failed: {exc}"
                         updated_history = history + [ChatTurn(question=message, answer=answer)]
                         return ChatResponse(
                             answer=answer,
                             sources=[],
                             history=updated_history,
                             provider="MCP",
-                            model=tool_name,
+                            model=tool_name or "tools/call",
                             provider_id=f"remote-mcp:{server_id}",
                         )
 
-            if action == "clarify":
-                question = (decision.get("question") if isinstance(decision, dict) else None) or "What inputs should I use for that tool?"
-                answer = str(question).strip()
-                updated_history = history + [ChatTurn(question=message, answer=answer)]
-                provider_label = PROVIDER_LABELS.get(router_provider or "", router_provider) if router_provider else None
-                return ChatResponse(
-                    answer=answer,
-                    sources=[],
-                    history=updated_history,
-                    provider=provider_label,
-                    model=router_model,
-                    provider_id="remote-mcp-router",
-                )
+                    tool_calls += 1
+                    used_servers.add(server_id)
+                    last_provider_id = provider_id
+                    last_tool_name = tool_name
+                    server_label = str(server_entry.get("name") or server_id)
+                    tool_history.append(
+                        {
+                            "server": server_label,
+                            "server_id": server_id,
+                            "tool": tool_name,
+                            "arguments": arguments,
+                            "result": result_text,
+                        }
+                    )
+
+                if tool_history:
+                    final_decision = await run_in_threadpool(
+                        _route_remote_mcp_request_with_llm,
+                        llm,
+                        message,
+                        remote_servers,
+                        tool_history,
+                        allow_tool_calls=False,
+                        allow_final=True,
+                        force_final=True,
+                    )
+                    if isinstance(final_decision, dict) and str(final_decision.get("action") or "").strip().lower() == "final":
+                        answer = str(final_decision.get("answer") or "").strip()
+                        if answer:
+                            updated_history = history + [ChatTurn(question=message, answer=answer)]
+                            provider_id = last_provider_id or "remote-tools"
+                            if len(used_servers) > 1:
+                                provider_id = "remote-tools"
+                            return ChatResponse(
+                                answer=answer,
+                                sources=[],
+                                history=updated_history,
+                                provider="MCP",
+                                model=last_tool_name or "remote-tools",
+                                provider_id=provider_id,
+                                tool_calls=_tool_calls_from_history(tool_history),
+                            )
+
+                    last = tool_history[-1]
+                    fallback = str(last.get("result") or "").strip()
+                    answer = fallback or "Remote tool call completed."
+                    updated_history = history + [ChatTurn(question=message, answer=answer)]
+                    provider_id = last_provider_id or "remote-tools"
+                    if len(used_servers) > 1:
+                        provider_id = "remote-tools"
+                    return ChatResponse(
+                        answer=answer,
+                        sources=[],
+                        history=updated_history,
+                        provider="MCP",
+                        model=last_tool_name or "remote-tools",
+                        provider_id=provider_id,
+                        tool_calls=_tool_calls_from_history(tool_history),
+                    )
 
         if app.state.startup_error:
             raise HTTPException(status_code=500, detail=app.state.startup_error)

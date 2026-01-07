@@ -63,9 +63,9 @@ Notes:
 - Override the server script path with `SAT_ORBIT_MCP_SERVER` if needed.
 - Override the TLE source (path or URL) with `SAT_ORBIT_TLE_SOURCE` (defaults to `SAT_Orbit_Sim_MCP/stations.txt` when present).
 
-## Remote MCP Servers (HTTP/SSE)
+## Remote MCP Servers (SSE + OpenAPI)
 
-The web UI Settings panel also supports adding **remote** MCP servers over HTTP (SSE transport). After you **Test & List Tools**, the returned tools are cached and the chat router can agentically call enabled remote tools.
+The web UI Settings panel supports adding **remote** MCP servers over HTTP (SSE transport) and MCPO servers that expose tools via OpenAPI. After you **Test & List Tools**, the returned tools are cached and the chat router can agentically call enabled remote tools.
 
 For local testing, you can run the included toy server:
 
@@ -74,6 +74,15 @@ python -m mcp_http_test_server.server --port 8001
 ```
 
 Then add `http://localhost:8001` under **Settings → MCP (Remote Servers)** and click **Test & List Tools**.
+
+For MCPO servers, enter the base URL (or an OpenAPI URL) and optionally override the OpenAPI URL:
+
+```text
+Base URL: http://e21172:8000
+OpenAPI URL: http://e21172:8000/openapi.json
+```
+
+After testing, tools like `POST /city_lla` will appear in the tool list and can be called with JSON arguments.
 
 ## Running via Docker
 
